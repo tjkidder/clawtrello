@@ -19,3 +19,41 @@ export interface Card {
   createdAt: string;
   updatedAt: string;
 }
+
+export type CardEventKey =
+  | 'card.created'
+  | 'card.assigned'
+  | 'card.moved'
+  | 'card.approved'
+  | 'card.delegated'
+  | 'card.delegation.progress'
+  | 'card.delegation.completed'
+  | 'card.delegation.failed'
+  | 'policy.reminder'
+  | 'policy.autoblocked';
+
+export interface CardTimelineEvent {
+  id: number;
+  cardId: string;
+  eventType: string;
+  eventKey: CardEventKey | string;
+  source: 'app' | 'openclaw' | 'policy' | string;
+  actorAgentId?: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface CardDelegation {
+  id: number;
+  cardId: string;
+  agentId: string;
+  runId?: string;
+  sessionKey?: string;
+  sessionId?: string;
+  status: string;
+  externalStatus?: string;
+  taskDescription?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
