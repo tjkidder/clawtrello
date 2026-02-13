@@ -157,8 +157,10 @@ export class OpenClawGateway {
       try {
         const msg = JSON.parse(raw);
         await this.handleMessage(msg);
-        const messageType = msg?.type === 'event' ? msg?.event : msg?.type;
-        if (messageType === 'hello-ok') {
+        const isHelloOk =
+          (msg?.type === 'res' && msg?.ok && msg?.payload?.type === 'hello-ok') ||
+          (msg?.type === 'event' && msg?.event === 'hello-ok');
+        if (isHelloOk) {
           handshakeComplete = true;
         }
       } catch (error) {
@@ -233,7 +235,7 @@ export class OpenClawGateway {
     }
 
     const requestId = randomUUID();
-    const sent = this.send({ id: requestId, type: method, payload });
+    const sent = this.send({ type: 'req', id: requestId, method, params: payload });
     if (!sent) {
       throw new Error('failed to send gateway request');
     }
@@ -249,7 +251,9 @@ export class OpenClawGateway {
   }
 
   private resolvePending(msg: any): boolean {
-    const requestId = msg?.replyTo ?? msg?.id;
+    if (msg?.type !== 'res') return false;
+
+    const requestId = msg?.id;
     if (!requestId || !this.pendingRequests.has(requestId)) {
       return false;
     }
@@ -258,12 +262,12 @@ export class OpenClawGateway {
     clearTimeout(pending.timer);
     this.pendingRequests.delete(requestId);
 
-    if (msg?.error) {
-      pending.reject(msg.error);
+    if (msg?.ok === false || msg?.error) {
+      pending.reject(msg.error ?? msg);
       return true;
     }
 
-    pending.resolve(msg?.payload ?? msg);
+    pending.resolve(msg?.payload);
     return true;
   }
 
@@ -273,17 +277,19 @@ export class OpenClawGateway {
     const messageType = msg?.type === 'event' ? msg?.event : msg?.type;
 
     if (messageType === 'connect.challenge') {
-      const nonce = msg?.nonce ?? msg?.payload?.nonce;
+      const nonce = msg?.payload?.nonce;
+      const requestId = randomUUID();
       console.info('[openclaw] challenge received');
       this.send({
-        type: 'connect',
-        payload: {
-          protocolVersion: 3,
+        type: 'req',
+        id: requestId,
+        method: 'connect',
+        params: {
+          minProtocol: 3,
+          maxProtocol: 3,
           auth: {
-            mode: 'token',
             token: this.token
           },
-          token: this.token,
           nonce,
           client: {
             name: 'clawtrello'
@@ -294,7 +300,10 @@ export class OpenClawGateway {
       return;
     }
 
-    if (messageType === 'hello-ok') {
+    const isHelloOk =
+      (msg?.type === 'res' && msg?.ok && msg?.payload?.type === 'hello-ok') ||
+      (msg?.type === 'event' && msg?.event === 'hello-ok');
+    if (isHelloOk) {
       this.isConnected = true;
       this.lastError = undefined;
       this.lastHandshakeAt = new Date().toISOString();
