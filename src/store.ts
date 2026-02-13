@@ -68,6 +68,28 @@ export async function appendEvent(input: {
   );
 }
 
+export async function hasRecentEvent(cardId: string, eventKey: string, windowMinutes: number): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT 1 FROM card_events
+      WHERE card_id = $1
+        AND event_key = $2
+        AND created_at >= NOW() - ($3::text || ' minutes')::interval
+      LIMIT 1`,
+    [cardId, eventKey, String(windowMinutes)]
+  );
+  return result.rowCount > 0;
+}
+
+export async function hasEvent(cardId: string, eventKey: string): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT 1 FROM card_events
+      WHERE card_id = $1 AND event_key = $2
+      LIMIT 1`,
+    [cardId, eventKey]
+  );
+  return result.rowCount > 0;
+}
+
 export async function listCards(): Promise<Card[]> {
   const result = await pool.query('SELECT * FROM cards ORDER BY created_at DESC');
   return result.rows.map(mapCard);
@@ -133,28 +155,36 @@ export async function approveCard(id: string): Promise<Card | undefined> {
   );
   if (!result.rowCount) return;
   const card = mapCard(result.rows[0]);
-  await appendEvent({ cardId: card.id, eventType: 'approval.accepted', eventKey: 'card.approved', payload: { approvedAt: card.approvedAt } });
+  await appendEvent({ cardId: card.id, eventType: 'approval.accepted', eventKey: 'approval.accepted', payload: { approvedAt: card.approvedAt } });
   return card;
 }
 
 export async function upsertAgents(agents: Agent[]): Promise<void> {
-  if (!agents.length) return;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    for (const agent of agents) {
-      await client.query(
-        `INSERT INTO agents(agent_id, name, emoji, theme, is_orchestrator, updated_at)
-         VALUES ($1,$2,$3,$4,$5,NOW())
-         ON CONFLICT(agent_id) DO UPDATE
-         SET name = EXCLUDED.name,
-             emoji = EXCLUDED.emoji,
-             theme = EXCLUDED.theme,
-             is_orchestrator = EXCLUDED.is_orchestrator,
-             updated_at = NOW()`,
-        [agent.agentId, agent.name, agent.emoji, agent.theme ?? null, agent.isOrchestrator]
-      );
+    if (agents.length) {
+      for (const agent of agents) {
+        await client.query(
+          `INSERT INTO agents(agent_id, name, emoji, theme, is_orchestrator, updated_at)
+           VALUES ($1,$2,$3,$4,$5,NOW())
+           ON CONFLICT(agent_id) DO UPDATE
+           SET name = EXCLUDED.name,
+               emoji = EXCLUDED.emoji,
+               theme = EXCLUDED.theme,
+               is_orchestrator = EXCLUDED.is_orchestrator,
+               updated_at = NOW()`,
+          [agent.agentId, agent.name, agent.emoji, agent.theme ?? null, agent.isOrchestrator]
+        );
+      }
     }
+
+    await client.query(
+      `DELETE FROM agents
+       WHERE agent_id NOT IN (SELECT unnest($1::text[]))`,
+      [agents.map((a) => a.agentId)]
+    );
+
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -171,15 +201,7 @@ export async function createDelegation(input: { cardId: string; agentId: string;
      RETURNING *`,
     [input.cardId, input.agentId, input.taskDescription ?? null]
   );
-  const delegation = mapDelegation(result.rows[0]);
-  await appendEvent({
-    cardId: input.cardId,
-    eventType: 'delegation.created',
-    eventKey: 'card.delegated',
-    actorAgentId: input.agentId,
-    payload: { delegation }
-  });
-  return delegation;
+  return mapDelegation(result.rows[0]);
 }
 
 export async function attachDelegationSession(
@@ -193,6 +215,7 @@ export async function attachDelegationSession(
           session_id = COALESCE($4, session_id),
           status = COALESCE($5, status),
           external_status = COALESCE($6, external_status),
+          last_activity_at = NOW(),
           updated_at = NOW()
       WHERE id = $1
       RETURNING *`,
@@ -207,16 +230,12 @@ export async function findDelegationByRunId(runId: string): Promise<CardDelegati
   return result.rowCount ? mapDelegation(result.rows[0]) : undefined;
 }
 
-export async function listPolicyCandidates(nowIso: string): Promise<Card[]> {
-  const result = await pool.query(
-    `SELECT * FROM cards
-      WHERE stage NOT IN ('done')
-        AND (
-          (due_at IS NOT NULL AND due_at <= $1::timestamptz)
-          OR (stage = 'review' AND updated_at < NOW() - INTERVAL '2 hours')
-          OR (updated_at < NOW() - INTERVAL '24 hours')
-        )`,
-    [nowIso]
-  );
+export async function findDelegationBySessionKey(sessionKey: string): Promise<CardDelegation | undefined> {
+  const result = await pool.query('SELECT * FROM card_delegations WHERE session_key = $1', [sessionKey]);
+  return result.rowCount ? mapDelegation(result.rows[0]) : undefined;
+}
+
+export async function listPolicyCandidates(): Promise<Card[]> {
+  const result = await pool.query("SELECT * FROM cards WHERE stage NOT IN ('done')");
   return result.rows.map(mapCard);
 }

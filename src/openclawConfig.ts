@@ -20,27 +20,43 @@ function parseOpenClawConfig(content: string): any {
   }
 }
 
-function fromConfig(): Agent[] {
+function readConfig(): any | undefined {
   if (!fs.existsSync(configPath)) {
-    return fallbackAgents;
+    return;
   }
 
   try {
-    const raw = parseOpenClawConfig(fs.readFileSync(configPath, 'utf8'));
-    const list = raw?.agents?.list ?? [];
-    const agents = list.map((a: any) => ({
-      agentId: a.id,
-      name: a.identity?.name || a.id,
-      emoji: a.identity?.emoji || '🤖',
-      theme: a.identity?.theme,
-      isOrchestrator: a.id === 'main' || a.id === 'orchestrator'
-    }));
-
-    return agents.length > 0 ? agents : fallbackAgents;
+    return parseOpenClawConfig(fs.readFileSync(configPath, 'utf8'));
   } catch (error) {
-    console.warn(`[openclaw] Failed to parse ${configPath}. Falling back to default specialists.`, error);
-    return fallbackAgents;
+    console.warn(`[openclaw] Failed to parse ${configPath}. Falling back to defaults.`, error);
+    return;
   }
+}
+
+function fromConfig(): Agent[] {
+  const raw = readConfig();
+  const list = raw?.agents?.list ?? [];
+  const agents = list.map((a: any) => ({
+    agentId: a.id,
+    name: a.identity?.name || a.id,
+    emoji: a.identity?.emoji || '🤖',
+    theme: a.identity?.theme,
+    isOrchestrator: a.id === 'main' || a.id === 'orchestrator'
+  }));
+
+  return agents.length > 0 ? agents : fallbackAgents;
+}
+
+export function loadGatewayRuntimeConfig(): { endpoint?: string; token?: string } {
+  const raw = readConfig();
+  const port = raw?.gateway?.port;
+  const token = raw?.gateway?.auth?.token;
+  const endpoint = typeof port === 'number' ? `ws://127.0.0.1:${port}` : undefined;
+
+  return {
+    endpoint: process.env.OPENCLAW_WS_URL ?? endpoint,
+    token: process.env.OPENCLAW_TOKEN ?? token
+  };
 }
 
 export function loadAgents(): Agent[] {
