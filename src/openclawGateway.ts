@@ -292,7 +292,8 @@ export class OpenClawGateway {
           client: {
             id: 'clawtrello',
             version: '0.1.0',
-            name: 'clawtrello'
+            platform: process.platform,
+            mode: 'operator'
           }
         }
       });
