@@ -3,7 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'node:http';
 import { Server } from 'socket.io';
-import { loadAgents, getConfigPath } from './openclawConfig.js';
+import { getConfigPath, loadAgents, loadGatewayRuntimeConfig } from './openclawConfig.js';
 import {
   approveCard,
   assignCard,
@@ -12,8 +12,9 @@ import {
   getCard,
   listCards,
   listCardTimeline,
-  moveCard,
-  upsertAgents
+  upsertAgents,
+  appendEvent,
+  moveCard
 } from './store.js';
 import { Stage } from './types.js';
 import { runMigrations } from './db.js';
@@ -23,7 +24,6 @@ import { startPolicyWorker } from './policyWorker.js';
 const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, { cors: { origin: '*' } });
-const openclawGateway = new OpenClawGateway();
 
 app.use(cors());
 app.use(express.json());
@@ -32,6 +32,20 @@ app.use(express.static('public'));
 let agents = loadAgents();
 const configPath = getConfigPath();
 let lastMtime = fs.existsSync(configPath) ? fs.statSync(configPath).mtimeMs : 0;
+
+function getSpecialists() {
+  return agents.filter((a) => !a.isOrchestrator);
+}
+
+const runtimeConfig = loadGatewayRuntimeConfig();
+const openclawGateway = new OpenClawGateway({
+  endpoint: runtimeConfig.endpoint,
+  token: runtimeConfig.token,
+  onCardChanged: async (cardId) => {
+    const card = await getCard(cardId);
+    if (card) io.emit('card.moved', card);
+  }
+});
 
 setInterval(async () => {
   if (!fs.existsSync(configPath)) return;
@@ -49,15 +63,18 @@ setInterval(async () => {
   }
 }, 5000);
 
-function getSpecialists() {
-  return agents.filter((a) => !a.isOrchestrator);
-}
-
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
 
 app.get('/api/agents', (_req, res) => {
+  res.json({ agents: getSpecialists() });
+});
+
+app.post('/api/agents/refresh', async (_req, res) => {
+  agents = loadAgents();
+  await upsertAgents(agents);
+  io.emit('agents.updated', getSpecialists());
   res.json({ agents: getSpecialists() });
 });
 
@@ -99,8 +116,37 @@ app.post('/api/cards/:id/delegate', async (req, res) => {
   if (!card) return res.status(404).json({ error: 'card not found' });
 
   const delegation = await createDelegation({ cardId: req.params.id, agentId, taskDescription });
+  await appendEvent({
+    cardId: req.params.id,
+    eventType: 'delegation.created',
+    eventKey: 'card.delegated',
+    source: 'app',
+    actorAgentId: agentId,
+    payload: { delegation }
+  });
+
+  let spawnResult: { ok: boolean; reason?: string } | undefined;
+  try {
+    spawnResult = await openclawGateway.spawnDelegation({
+      delegationId: delegation.id,
+      cardId: req.params.id,
+      agentId,
+      taskDescription
+    });
+  } catch (error) {
+    spawnResult = { ok: false, reason: String(error) };
+    await appendEvent({
+      cardId: req.params.id,
+      eventType: 'delegation.spawn_failed',
+      eventKey: 'card.blocked',
+      source: 'openclaw',
+      actorAgentId: agentId,
+      payload: { error: String(error) }
+    });
+  }
+
   io.emit('card.delegated', { cardId: req.params.id, delegation });
-  res.status(201).json({ delegation });
+  res.status(201).json({ delegation, spawn: spawnResult ?? { ok: false, reason: 'unknown' } });
 });
 
 app.post('/api/delegations/:sessionKey/resume', async (req, res) => {

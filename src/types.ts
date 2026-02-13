@@ -24,13 +24,16 @@ export type CardEventKey =
   | 'card.created'
   | 'card.assigned'
   | 'card.moved'
-  | 'card.approved'
+  | 'approval.accepted'
+  | 'approval.requested'
   | 'card.delegated'
-  | 'card.delegation.progress'
-  | 'card.delegation.completed'
-  | 'card.delegation.failed'
-  | 'policy.reminder'
-  | 'policy.autoblocked';
+  | 'agent.started'
+  | 'agent.progress'
+  | 'card.completed'
+  | 'card.blocked'
+  | 'card.due_soon'
+  | 'card.overdue'
+  | 'card.review_stale';
 
 export interface CardTimelineEvent {
   id: number;
