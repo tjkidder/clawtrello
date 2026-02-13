@@ -290,9 +290,9 @@ export class OpenClawGateway {
             token: this.token
           },
           client: {
-            id: 'clawtrello',
+            id: 'cli',
             version: '0.1.0',
-            platform: process.platform,
+            platform: 'macos',
             mode: 'operator'
           }
         }
