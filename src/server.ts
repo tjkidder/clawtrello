@@ -71,6 +71,10 @@ app.get('/api/agents', (_req, res) => {
   res.json({ agents: getSpecialists() });
 });
 
+app.get('/api/openclaw/status', (_req, res) => {
+  res.json(openclawGateway.getStatus());
+});
+
 app.post('/api/agents/refresh', async (_req, res) => {
   agents = loadAgents();
   await upsertAgents(agents);

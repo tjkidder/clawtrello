@@ -50,7 +50,7 @@ function fromConfig(): Agent[] {
 export function loadGatewayRuntimeConfig(): { endpoint?: string; token?: string } {
   const raw = readConfig();
   const port = raw?.gateway?.port;
-  const token = raw?.gateway?.auth?.token;
+  const token = raw?.gateway?.token ?? raw?.gateway?.auth?.token;
   const endpoint = typeof port === 'number' ? `ws://127.0.0.1:${port}` : undefined;
 
   return {
