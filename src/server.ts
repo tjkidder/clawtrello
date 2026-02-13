@@ -38,6 +38,19 @@ function getSpecialists() {
 }
 
 const runtimeConfig = loadGatewayRuntimeConfig();
+
+function stringifyErr(err: any): string {
+  if (!err) return 'unknown error';
+  if (typeof err === 'string') return err;
+  if (err instanceof Error) return err.message;
+  if (err?.error?.message) return err.error.message;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+
 const openclawGateway = new OpenClawGateway({
   endpoint: runtimeConfig.endpoint,
   token: runtimeConfig.token,
@@ -138,14 +151,15 @@ app.post('/api/cards/:id/delegate', async (req, res) => {
       taskDescription
     });
   } catch (error) {
-    spawnResult = { ok: false, reason: String(error) };
+    console.error('[delegate] spawn failed:', error);
+    spawnResult = { ok: false, reason: stringifyErr(error) };
     await appendEvent({
       cardId: req.params.id,
       eventType: 'delegation.spawn_failed',
       eventKey: 'card.blocked',
       source: 'openclaw',
       actorAgentId: agentId,
-      payload: { error: String(error) }
+      payload: { error: stringifyErr(error) }
     });
   }
 

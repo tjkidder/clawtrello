@@ -37,11 +37,13 @@ export class OpenClawGateway {
   private readonly wsSubprotocol?: string;
   private readonly wsHeaders?: Record<string, string>;
   private readonly onCardChanged?: (cardId: string) => void;
+  private readonly clientMode: string;
   private lastError?: string;
   private lastHandshakeAt?: string;
   private lastCloseCode?: number;
   private lastCloseReason?: string;
   private challengeWatchdog?: NodeJS.Timeout;
+  private supportedMethods: string[] = [];
 
   constructor(options: GatewayOptions = {}) {
     this.endpoint = options.endpoint ?? process.env.OPENCLAW_WS_URL;
@@ -50,6 +52,7 @@ export class OpenClawGateway {
     this.wsSubprotocol = options.subprotocol ?? process.env.OPENCLAW_WS_SUBPROTOCOL;
     this.wsHeaders = options.headers ?? this.parseHeaders(process.env.OPENCLAW_WS_HEADERS_JSON);
     this.onCardChanged = options.onCardChanged;
+    this.clientMode = process.env.OPENCLAW_CLIENT_MODE ?? 'cli';
   }
 
   start() {
@@ -87,14 +90,21 @@ export class OpenClawGateway {
       return { ok: false as const, reason: 'gateway_disabled' };
     }
 
-    const response = await this.request('sessions_spawn', {
-      agentId: input.agentId,
-      instruction: input.taskDescription,
-      metadata: {
-        cardId: input.cardId,
-        delegationId: input.delegationId
-      }
-    });
+    const method = this.resolveSpawnMethod();
+    let response: any;
+    try {
+      response = await this.request(method, {
+        agentId: input.agentId,
+        instruction: input.taskDescription,
+        metadata: {
+          cardId: input.cardId,
+          delegationId: input.delegationId
+        }
+      });
+    } catch (error) {
+      console.error('[openclaw] spawn request failed:', error);
+      throw error;
+    }
 
     const runId = response?.runId ?? response?.payload?.runId;
     const sessionKey = response?.sessionKey ?? response?.payload?.sessionKey ?? response?.payload?.childSessionKey;
@@ -279,6 +289,7 @@ export class OpenClawGateway {
     if (messageType === 'connect.challenge') {
       const requestId = randomUUID();
       console.info('[openclaw] challenge received');
+      console.info(`[openclaw] connect client.mode=${this.clientMode}`);
       this.send({
         type: 'req',
         id: requestId,
@@ -293,7 +304,7 @@ export class OpenClawGateway {
             id: 'cli',
             version: '0.1.0',
             platform: 'macos',
-            mode: 'operator'
+            mode: this.clientMode
           }
         }
       });
@@ -305,11 +316,13 @@ export class OpenClawGateway {
       (msg?.type === 'res' && msg?.ok && msg?.payload?.type === 'hello-ok') ||
       (msg?.type === 'event' && msg?.event === 'hello-ok');
     if (isHelloOk) {
+      this.supportedMethods = msg?.payload?.features?.methods ?? [];
       this.isConnected = true;
       this.lastError = undefined;
       this.lastHandshakeAt = new Date().toISOString();
       this.reconnectDelayMs = 1000;
       console.info('[openclaw] hello-ok received; gateway connected');
+      console.info('[openclaw] supported methods:', this.supportedMethods);
       return;
     }
 
@@ -415,6 +428,16 @@ export class OpenClawGateway {
       console.warn('[openclaw] failed to parse OPENCLAW_WS_HEADERS_JSON', error);
       return undefined;
     }
+  }
+
+  private resolveSpawnMethod(): string {
+    if (this.supportedMethods.includes('sessions.spawn')) return 'sessions.spawn';
+    if (this.supportedMethods.includes('session.spawn')) return 'session.spawn';
+    if (this.supportedMethods.includes('runs.spawn')) return 'runs.spawn';
+
+    throw new Error(
+      `Gateway does not advertise a spawn method. Known methods: ${JSON.stringify(this.supportedMethods)}`
+    );
   }
 
   private async messageToString(data: unknown): Promise<string> {
