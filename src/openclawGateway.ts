@@ -277,7 +277,6 @@ export class OpenClawGateway {
     const messageType = msg?.type === 'event' ? msg?.event : msg?.type;
 
     if (messageType === 'connect.challenge') {
-      const nonce = msg?.payload?.nonce;
       const requestId = randomUUID();
       console.info('[openclaw] challenge received');
       this.send({
@@ -290,8 +289,9 @@ export class OpenClawGateway {
           auth: {
             token: this.token
           },
-          nonce,
           client: {
+            id: 'clawtrello',
+            version: '0.1.0',
             name: 'clawtrello'
           }
         }
