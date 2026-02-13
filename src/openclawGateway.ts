@@ -4,6 +4,9 @@ import { appendEvent, attachDelegationSession, findDelegationByRunId, findDelega
 interface GatewayOptions {
   endpoint?: string;
   token?: string;
+  origin?: string;
+  subprotocol?: string;
+  headers?: Record<string, string>;
   onCardChanged?: (cardId: string) => void;
 }
 
@@ -18,6 +21,8 @@ interface GatewayStatus {
   url?: string;
   lastError?: string;
   lastHandshakeAt?: string;
+  lastCloseCode?: number;
+  lastCloseReason?: string;
 }
 
 export class OpenClawGateway {
@@ -28,13 +33,22 @@ export class OpenClawGateway {
   private pendingRequests = new Map<string, PendingRequest>();
   private readonly endpoint?: string;
   private readonly token?: string;
+  private readonly wsOrigin?: string;
+  private readonly wsSubprotocol?: string;
+  private readonly wsHeaders?: Record<string, string>;
   private readonly onCardChanged?: (cardId: string) => void;
   private lastError?: string;
   private lastHandshakeAt?: string;
+  private lastCloseCode?: number;
+  private lastCloseReason?: string;
+  private challengeWatchdog?: NodeJS.Timeout;
 
   constructor(options: GatewayOptions = {}) {
     this.endpoint = options.endpoint ?? process.env.OPENCLAW_WS_URL;
     this.token = options.token ?? process.env.OPENCLAW_TOKEN;
+    this.wsOrigin = options.origin ?? process.env.OPENCLAW_WS_ORIGIN;
+    this.wsSubprotocol = options.subprotocol ?? process.env.OPENCLAW_WS_SUBPROTOCOL;
+    this.wsHeaders = options.headers ?? this.parseHeaders(process.env.OPENCLAW_WS_HEADERS_JSON);
     this.onCardChanged = options.onCardChanged;
   }
 
@@ -57,7 +71,9 @@ export class OpenClawGateway {
       connected: this.isConnected,
       url: this.endpoint,
       lastError: this.lastError,
-      lastHandshakeAt: this.lastHandshakeAt
+      lastHandshakeAt: this.lastHandshakeAt,
+      lastCloseCode: this.lastCloseCode,
+      lastCloseReason: this.lastCloseReason
     };
   }
 
@@ -110,28 +126,73 @@ export class OpenClawGateway {
 
   private connect() {
     console.info(`[openclaw] connecting to ${this.endpoint}`);
-    this.ws = new WebSocket(this.endpoint!);
+    const headers: Record<string, string> = { ...(this.wsHeaders ?? {}) };
+    if (this.wsOrigin) {
+      headers.Origin = this.wsOrigin;
+    }
+
+    const wsInit: { protocols?: string; headers?: Record<string, string> } = {};
+    if (this.wsSubprotocol) wsInit.protocols = this.wsSubprotocol;
+    if (Object.keys(headers).length > 0) wsInit.headers = headers;
+
+    const WebSocketWithInit = WebSocket as unknown as {
+      new (url: string, protocols?: string | string[] | { protocols?: string | string[]; headers?: Record<string, string> }): WebSocket;
+      OPEN: number;
+    };
+
+    this.ws = new WebSocketWithInit(this.endpoint!, wsInit);
+    let receivedAnyMessage = false;
+    let handshakeComplete = false;
+
+    this.ws.addEventListener('message', async (event: MessageEvent) => {
+      receivedAnyMessage = true;
+      if (this.challengeWatchdog) {
+        clearTimeout(this.challengeWatchdog);
+        this.challengeWatchdog = undefined;
+      }
+
+      const raw = await this.messageToString(event.data);
+      console.info(`[openclaw] raw frame received: ${this.truncateForLog(raw)}`);
+
+      try {
+        const msg = JSON.parse(raw);
+        await this.handleMessage(msg);
+        const messageType = msg?.type === 'event' ? msg?.event : msg?.type;
+        if (messageType === 'hello-ok') {
+          handshakeComplete = true;
+        }
+      } catch (error) {
+        this.lastError = `failed to handle message: ${String(error)}`;
+        console.warn(`[openclaw] failed to parse/handle frame frame=${this.truncateForLog(raw)}`, error);
+      }
+    });
 
     this.ws.addEventListener('open', () => {
       this.isConnected = false;
       this.lastError = undefined;
-      console.info('[openclaw] websocket open; awaiting challenge');
+      const wsOptionsLog = JSON.stringify({
+        subprotocol: this.wsSubprotocol,
+        headers
+      });
+      console.info(`[openclaw] websocket open; awaiting challenge (options=${wsOptionsLog})`);
+
+      this.challengeWatchdog = setTimeout(() => {
+        if (receivedAnyMessage || this.isConnected) return;
+        console.warn(`[openclaw] no challenge received within 500ms (url=${this.endpoint}, options=${wsOptionsLog})`);
+      }, 500);
     });
 
-    this.ws.addEventListener('message', async (event) => {
-      try {
-        const msg = JSON.parse(String(event.data));
-        await this.handleMessage(msg);
-      } catch (error) {
-        this.lastError = `failed to handle message: ${String(error)}`;
-        console.warn('[openclaw] failed to handle message', error);
-      }
-    });
-
-    this.ws.addEventListener('close', (event) => {
+    this.ws.addEventListener('close', (event: CloseEvent) => {
       this.isConnected = false;
+      this.lastCloseCode = event.code;
       const reason = event.reason || '(no reason provided)';
-      this.lastError = `socket closed (${event.code}): ${reason}`;
+      this.lastCloseReason = reason;
+      if (this.challengeWatchdog) {
+        clearTimeout(this.challengeWatchdog);
+        this.challengeWatchdog = undefined;
+      }
+
+      this.lastError = handshakeComplete ? `socket closed (${event.code}): ${reason}` : 'closed before handshake complete';
       console.warn(`[openclaw] websocket closed code=${event.code} reason=${reason}`);
       this.rejectPendingRequests(new Error('gateway websocket closed'));
       this.scheduleReconnect();
@@ -209,7 +270,9 @@ export class OpenClawGateway {
   private async handleMessage(msg: any) {
     if (this.resolvePending(msg)) return;
 
-    if (msg?.type === 'connect.challenge') {
+    const messageType = msg?.type === 'event' ? msg?.event : msg?.type;
+
+    if (messageType === 'connect.challenge') {
       const nonce = msg?.nonce ?? msg?.payload?.nonce;
       console.info('[openclaw] challenge received');
       this.send({
@@ -231,7 +294,7 @@ export class OpenClawGateway {
       return;
     }
 
-    if (msg?.type === 'hello-ok') {
+    if (messageType === 'hello-ok') {
       this.isConnected = true;
       this.lastError = undefined;
       this.lastHandshakeAt = new Date().toISOString();
@@ -250,7 +313,7 @@ export class OpenClawGateway {
 
     if (!delegation) return;
 
-    switch (msg.type) {
+    switch (messageType) {
       case 'session.updated':
         await attachDelegationSession(delegation.id, {
           status: 'in_progress',
@@ -260,7 +323,7 @@ export class OpenClawGateway {
         });
         await appendEvent({
           cardId: delegation.cardId,
-          eventType: msg.type,
+          eventType: messageType,
           eventKey: 'agent.progress',
           source: 'openclaw',
           actorAgentId: delegation.agentId,
@@ -276,7 +339,7 @@ export class OpenClawGateway {
         this.onCardChanged?.(delegation.cardId);
         await appendEvent({
           cardId: delegation.cardId,
-          eventType: msg.type,
+          eventType: messageType,
           eventKey: 'card.completed',
           source: 'openclaw',
           actorAgentId: delegation.agentId,
@@ -292,7 +355,7 @@ export class OpenClawGateway {
         this.onCardChanged?.(delegation.cardId);
         await appendEvent({
           cardId: delegation.cardId,
-          eventType: msg.type,
+          eventType: messageType,
           eventKey: 'card.blocked',
           source: 'openclaw',
           actorAgentId: delegation.agentId,
@@ -309,7 +372,7 @@ export class OpenClawGateway {
         this.onCardChanged?.(delegation.cardId);
         await appendEvent({
           cardId: delegation.cardId,
-          eventType: msg.type,
+          eventType: messageType,
           eventKey: 'approval.requested',
           source: 'openclaw',
           actorAgentId: delegation.agentId,
@@ -320,5 +383,39 @@ export class OpenClawGateway {
       default:
         break;
     }
+  }
+
+  private parseHeaders(headersJson: string | undefined): Record<string, string> | undefined {
+    if (!headersJson) return undefined;
+
+    try {
+      const parsed = JSON.parse(headersJson);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        this.lastError = 'OPENCLAW_WS_HEADERS_JSON must be a JSON object';
+        return undefined;
+      }
+
+      return Object.fromEntries(
+        Object.entries(parsed)
+          .filter(([, value]) => typeof value === 'string')
+          .map(([key, value]) => [key, value as string])
+      );
+    } catch (error) {
+      this.lastError = `failed to parse OPENCLAW_WS_HEADERS_JSON: ${String(error)}`;
+      console.warn('[openclaw] failed to parse OPENCLAW_WS_HEADERS_JSON', error);
+      return undefined;
+    }
+  }
+
+  private async messageToString(data: unknown): Promise<string> {
+    if (typeof data === 'string') return data;
+    if (data instanceof Blob) return data.text();
+    if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8');
+    if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer).toString('utf8');
+    return String(data);
+  }
+
+  private truncateForLog(text: string, limit = 300): string {
+    return text.length > limit ? `${text.slice(0, limit)}…` : text;
   }
 }
