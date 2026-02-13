@@ -27,6 +27,7 @@
         <h2 class="text-2xl font-bold">Project: Alpha Board</h2>
         <form id="newTaskForm" class="flex gap-2">
           <input id="title" class="border rounded px-2" placeholder="New task title" required />
+          <input id="description" class="border rounded px-2" placeholder="Description" />
           <input id="dueAt" type="datetime-local" class="border rounded px-2" />
           <button class="bg-blue-600 text-white rounded px-3 py-1">New Task</button>
         </form>
@@ -47,6 +48,16 @@ const stages = [
 
 let cards = [];
 let agents = [];
+let draggingCardId = null;
+
+function escapeHtml(value){
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
 
 function badge(stage){
   const m = { backlog:'bg-slate-200', in_progress:'bg-blue-100 text-blue-700', review:'bg-orange-100 text-orange-700', blocked:'bg-red-100 text-red-700', done:'bg-green-100 text-green-700'};
@@ -60,6 +71,27 @@ function render(){
   for (const [key, label] of stages){
     const col = document.createElement('section');
     col.className = 'min-w-[280px] bg-slate-50 border rounded p-3';
+    col.dataset.stage = key;
+    col.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      col.classList.add('ring-2', 'ring-blue-400');
+    });
+    col.addEventListener('dragleave', () => {
+      col.classList.remove('ring-2', 'ring-blue-400');
+    });
+    col.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      col.classList.remove('ring-2', 'ring-blue-400');
+      const id = e.dataTransfer?.getData('text/plain') || draggingCardId;
+      if (!id) return;
+      const card = cards.find((c) => c.id === id);
+      if (!card || card.stage === key) return;
+      await fetch(`/api/cards/${id}/move`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ stage: key })
+      });
+    });
     const stageCards = cards.filter(c => c.stage === key);
 
     col.innerHTML = `<div class="flex items-center justify-between mb-3"><h3 class="font-bold">${label}</h3><span class="text-xs bg-slate-200 rounded-full px-2">${stageCards.length}</span></div>`;
@@ -67,13 +99,32 @@ function render(){
     stageCards.forEach(card => {
       const el = document.createElement('article');
       el.className = 'bg-white border rounded p-3 mb-2 space-y-2';
+      el.draggable = true;
+      el.addEventListener('dragstart', (e) => {
+        draggingCardId = card.id;
+        if (e.dataTransfer) {
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', card.id);
+        }
+        el.classList.add('opacity-60');
+      });
+      el.addEventListener('dragend', () => {
+        draggingCardId = null;
+        el.classList.remove('opacity-60');
+        document.querySelectorAll('#board section').forEach((section) => {
+          section.classList.remove('ring-2', 'ring-blue-400');
+        });
+      });
       const due = card.dueAt ? new Date(card.dueAt).toLocaleString() : 'No due date';
+      const safeTitle = escapeHtml(card.title);
+      const safeDescription = escapeHtml(card.description || '');
       const agentOptions = ['<option value="">Unassigned</option>'].concat(
         agents.map(a => `<option value="${a.agentId}" ${a.agentId===card.assigneeAgentId?'selected':''}>${a.emoji} ${a.name}</option>`)
       ).join('');
 
       el.innerHTML = `
-        <div class="font-semibold">${card.title}</div>
+        <div class="font-semibold">${safeTitle}</div>
+        ${safeDescription ? `<div class="text-sm text-slate-700">${safeDescription}</div>` : ''}
         <div class="text-xs text-slate-500">${due}</div>
         <div class="text-xs"><span class="px-2 py-1 rounded ${badge(card.stage)}">${card.stage}</span></div>
         <select data-id="${card.id}" class="assign w-full border rounded px-2 py-1 text-sm">${agentOptions}</select>
@@ -121,11 +172,12 @@ socket.on('agents.updated', (a) => { agents = a; render(); });
 document.getElementById('newTaskForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const title = document.getElementById('title').value;
+  const description = document.getElementById('description').value;
   const dueAt = document.getElementById('dueAt').value;
   await fetch('/api/cards', {
     method: 'POST',
     headers: { 'Content-Type':'application/json' },
-    body: JSON.stringify({ title, dueAt: dueAt || undefined })
+    body: JSON.stringify({ title, description: description || undefined, dueAt: dueAt || undefined })
   });
   e.target.reset();
 });
