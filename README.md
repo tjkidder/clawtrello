@@ -45,3 +45,12 @@ Current schema includes:
 - `card_delegations`
 - `card_events`
 - `schema_migrations`
+
+
+## OpenClaw gateway env vars
+
+- `OPENCLAW_WS_URL`: gateway websocket endpoint.
+- `OPENCLAW_TOKEN`: token used for `connect` auth.
+- `OPENCLAW_WS_ORIGIN` (optional): explicit `Origin` header for the websocket handshake.
+- `OPENCLAW_WS_SUBPROTOCOL` (optional): websocket subprotocol value.
+- `OPENCLAW_WS_HEADERS_JSON` (optional): JSON object string with extra handshake headers.
