@@ -90,32 +90,44 @@ export class OpenClawGateway {
       return { ok: false as const, reason: 'gateway_disabled' };
     }
 
-    const method = this.resolveSpawnMethod();
+    this.ensureMethod('agent');
+    const sessionKey = this.buildDelegationSessionKey(input.cardId, input.agentId);
+    const idempotencyKey = `delegation:${input.delegationId}:card:${input.cardId}:agent:${input.agentId}`;
     let response: any;
     try {
-      response = await this.request(method, {
+      response = await this.runAgentTask({
         agentId: input.agentId,
-        instruction: input.taskDescription,
-        metadata: {
-          cardId: input.cardId,
-          delegationId: input.delegationId
-        }
+        sessionKey,
+        idempotencyKey,
+        message: input.taskDescription ?? '',
+        timeoutSeconds: 600
       });
+
+      if (this.supportedMethods.includes('agent.wait')) {
+        await this.request(
+          'agent.wait',
+          {
+            sessionKey,
+            timeoutMs: 30_000
+          },
+          35_000
+        );
+      }
     } catch (error) {
-      console.error('[openclaw] spawn request failed:', error);
+      console.error('[openclaw] delegation start request failed:', error);
       throw error;
     }
 
     const runId = response?.runId ?? response?.payload?.runId;
-    const sessionKey = response?.sessionKey ?? response?.payload?.sessionKey ?? response?.payload?.childSessionKey;
+    const responseSessionKey = response?.sessionKey ?? response?.payload?.sessionKey ?? response?.payload?.childSessionKey;
     const sessionId = response?.sessionId ?? response?.payload?.sessionId;
 
     const delegation = await attachDelegationSession(input.delegationId, {
       runId,
-      sessionKey,
+      sessionKey: responseSessionKey ?? sessionKey,
       sessionId,
       status: 'active',
-      externalStatus: 'spawned'
+      externalStatus: 'started'
     });
 
     await appendEvent({
@@ -124,10 +136,17 @@ export class OpenClawGateway {
       eventKey: 'agent.started',
       source: 'openclaw',
       actorAgentId: input.agentId,
-      payload: { runId, sessionKey, sessionId }
+      payload: { runId, sessionKey: responseSessionKey ?? sessionKey, sessionId, methodUsed: 'agent' }
     });
 
-    return { ok: true as const, delegation };
+    return {
+      ok: true as const,
+      methodUsed: 'agent',
+      delegation,
+      sessionKey: responseSessionKey ?? sessionKey,
+      runId,
+      sessionId
+    };
   }
 
   async sendResume(sessionKey: string, message: string) {
@@ -239,12 +258,31 @@ export class OpenClawGateway {
     return true;
   }
 
-  private async request(method: string, payload: Record<string, unknown>): Promise<any> {
+  async runAgentTask(params: {
+    agentId: string;
+    message: string;
+    sessionKey: string;
+    idempotencyKey: string;
+    timeoutSeconds?: number;
+  }): Promise<any> {
+    this.ensureMethod('agent');
+
+    return this.request('agent', {
+      idempotencyKey: params.idempotencyKey,
+      agentId: params.agentId,
+      sessionKey: params.sessionKey,
+      message: params.message,
+      timeout: params.timeoutSeconds ?? 600
+    });
+  }
+
+  private async request(method: string, payload: Record<string, unknown>, timeoutMs = 15_000): Promise<any> {
     if (!this.isConnected) {
       throw new Error(`openclaw gateway is not connected; cannot call ${method}`);
     }
 
     const requestId = randomUUID();
+    console.info(`[openclaw] request method=${method}`);
     const sent = this.send({ type: 'req', id: requestId, method, params: payload });
     if (!sent) {
       throw new Error('failed to send gateway request');
@@ -254,7 +292,7 @@ export class OpenClawGateway {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(requestId);
         reject(new Error(`gateway request timeout for ${method}`));
-      }, 15_000);
+      }, timeoutMs);
 
       this.pendingRequests.set(requestId, { resolve, reject, timer });
     });
@@ -430,14 +468,13 @@ export class OpenClawGateway {
     }
   }
 
-  private resolveSpawnMethod(): string {
-    if (this.supportedMethods.includes('sessions.spawn')) return 'sessions.spawn';
-    if (this.supportedMethods.includes('session.spawn')) return 'session.spawn';
-    if (this.supportedMethods.includes('runs.spawn')) return 'runs.spawn';
+  private ensureMethod(method: string): void {
+    if (this.supportedMethods.includes(method)) return;
+    throw new Error(`Gateway does not advertise method ${method}. Known methods: ${JSON.stringify(this.supportedMethods)}`);
+  }
 
-    throw new Error(
-      `Gateway does not advertise a spawn method. Known methods: ${JSON.stringify(this.supportedMethods)}`
-    );
+  private buildDelegationSessionKey(cardId: string, agentId: string): string {
+    return `clawtrello:card:${cardId}:agent:${agentId}`;
   }
 
   private async messageToString(data: unknown): Promise<string> {

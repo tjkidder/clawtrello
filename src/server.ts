@@ -142,7 +142,16 @@ app.post('/api/cards/:id/delegate', async (req, res) => {
     payload: { delegation }
   });
 
-  let spawnResult: { ok: boolean; reason?: string } | undefined;
+  let spawnResult:
+    | {
+        ok: boolean;
+        reason?: string;
+        methodUsed?: string;
+        sessionKey?: string;
+        runId?: string;
+        sessionId?: string;
+      }
+    | undefined;
   try {
     spawnResult = await openclawGateway.spawnDelegation({
       delegationId: delegation.id,
@@ -151,7 +160,7 @@ app.post('/api/cards/:id/delegate', async (req, res) => {
       taskDescription
     });
   } catch (error) {
-    console.error('[delegate] spawn failed:', error);
+    console.error('[delegate] agent start failed:', error);
     spawnResult = { ok: false, reason: stringifyErr(error) };
     await appendEvent({
       cardId: req.params.id,
