@@ -13,6 +13,13 @@ interface PendingRequest {
   timer: NodeJS.Timeout;
 }
 
+interface GatewayStatus {
+  connected: boolean;
+  url?: string;
+  lastError?: string;
+  lastHandshakeAt?: string;
+}
+
 export class OpenClawGateway {
   private ws?: WebSocket;
   private reconnectTimer?: NodeJS.Timeout;
@@ -22,6 +29,8 @@ export class OpenClawGateway {
   private readonly endpoint?: string;
   private readonly token?: string;
   private readonly onCardChanged?: (cardId: string) => void;
+  private lastError?: string;
+  private lastHandshakeAt?: string;
 
   constructor(options: GatewayOptions = {}) {
     this.endpoint = options.endpoint ?? process.env.OPENCLAW_WS_URL;
@@ -30,13 +39,26 @@ export class OpenClawGateway {
   }
 
   start() {
-    if (!this.endpoint) return;
+    if (!this.endpoint) {
+      this.lastError = 'gateway endpoint is not configured';
+      console.warn('[openclaw] gateway disabled: no endpoint configured');
+      return;
+    }
     this.connect();
   }
 
   stop() {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.ws?.close();
+  }
+
+  getStatus(): GatewayStatus {
+    return {
+      connected: this.isConnected,
+      url: this.endpoint,
+      lastError: this.lastError,
+      lastHandshakeAt: this.lastHandshakeAt
+    };
   }
 
   async spawnDelegation(input: {
@@ -59,7 +81,7 @@ export class OpenClawGateway {
     });
 
     const runId = response?.runId ?? response?.payload?.runId;
-    const sessionKey = response?.sessionKey ?? response?.payload?.sessionKey;
+    const sessionKey = response?.sessionKey ?? response?.payload?.sessionKey ?? response?.payload?.childSessionKey;
     const sessionId = response?.sessionId ?? response?.payload?.sessionId;
 
     const delegation = await attachDelegationSession(input.delegationId, {
@@ -87,10 +109,13 @@ export class OpenClawGateway {
   }
 
   private connect() {
+    console.info(`[openclaw] connecting to ${this.endpoint}`);
     this.ws = new WebSocket(this.endpoint!);
 
     this.ws.addEventListener('open', () => {
       this.isConnected = false;
+      this.lastError = undefined;
+      console.info('[openclaw] websocket open; awaiting challenge');
     });
 
     this.ws.addEventListener('message', async (event) => {
@@ -98,23 +123,39 @@ export class OpenClawGateway {
         const msg = JSON.parse(String(event.data));
         await this.handleMessage(msg);
       } catch (error) {
+        this.lastError = `failed to handle message: ${String(error)}`;
         console.warn('[openclaw] failed to handle message', error);
       }
     });
 
-    this.ws.addEventListener('close', () => {
+    this.ws.addEventListener('close', (event) => {
       this.isConnected = false;
+      const reason = event.reason || '(no reason provided)';
+      this.lastError = `socket closed (${event.code}): ${reason}`;
+      console.warn(`[openclaw] websocket closed code=${event.code} reason=${reason}`);
+      this.rejectPendingRequests(new Error('gateway websocket closed'));
       this.scheduleReconnect();
     });
 
     this.ws.addEventListener('error', (error) => {
+      this.lastError = `websocket error: ${String(error)}`;
       console.warn('[openclaw] websocket error', error);
     });
   }
 
+  private rejectPendingRequests(error: Error) {
+    for (const [requestId, pending] of this.pendingRequests.entries()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+      this.pendingRequests.delete(requestId);
+    }
+  }
+
   private scheduleReconnect() {
+    if (!this.endpoint) return;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     const waitMs = this.reconnectDelayMs;
+    console.info(`[openclaw] scheduling reconnect in ${waitMs}ms`);
     this.reconnectTimer = setTimeout(() => this.connect(), waitMs);
     this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 30_000);
   }
@@ -169,25 +210,38 @@ export class OpenClawGateway {
     if (this.resolvePending(msg)) return;
 
     if (msg?.type === 'connect.challenge') {
+      const nonce = msg?.nonce ?? msg?.payload?.nonce;
+      console.info('[openclaw] challenge received');
       this.send({
         type: 'connect',
         payload: {
-          token: this.token,
           protocolVersion: 3,
-          client: 'clawtrello'
+          auth: {
+            mode: 'token',
+            token: this.token
+          },
+          token: this.token,
+          nonce,
+          client: {
+            name: 'clawtrello'
+          }
         }
       });
+      console.info('[openclaw] connect sent (token redacted)');
       return;
     }
 
     if (msg?.type === 'hello-ok') {
       this.isConnected = true;
+      this.lastError = undefined;
+      this.lastHandshakeAt = new Date().toISOString();
       this.reconnectDelayMs = 1000;
+      console.info('[openclaw] hello-ok received; gateway connected');
       return;
     }
 
     const runId = msg?.runId ?? msg?.payload?.runId;
-    const sessionKey = msg?.sessionKey ?? msg?.payload?.sessionKey;
+    const sessionKey = msg?.sessionKey ?? msg?.payload?.sessionKey ?? msg?.payload?.childSessionKey;
     const delegation = runId
       ? await findDelegationByRunId(runId)
       : sessionKey
@@ -202,7 +256,7 @@ export class OpenClawGateway {
           status: 'in_progress',
           externalStatus: msg.payload?.status,
           sessionId: msg.payload?.sessionId,
-          sessionKey: msg.payload?.sessionKey
+          sessionKey: msg.payload?.sessionKey ?? msg.payload?.childSessionKey
         });
         await appendEvent({
           cardId: delegation.cardId,
