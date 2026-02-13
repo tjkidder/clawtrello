@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { pool } from './db.js';
-import { Card, Stage } from './types.js';
+import { Agent, Card, CardDelegation, CardTimelineEvent, Stage } from './types.js';
 
 function mapCard(row: any): Card {
   return {
@@ -16,17 +16,71 @@ function mapCard(row: any): Card {
   };
 }
 
-async function appendEvent(cardId: string, eventType: string, payload: unknown) {
-  await pool.query('INSERT INTO card_events(card_id, event_type, payload) VALUES ($1, $2, $3::jsonb)', [
-    cardId,
-    eventType,
-    JSON.stringify(payload ?? {})
-  ]);
+function mapEvent(row: any): CardTimelineEvent {
+  return {
+    id: row.id,
+    cardId: row.card_id,
+    eventType: row.event_type,
+    eventKey: row.event_key ?? row.event_type,
+    source: row.source,
+    actorAgentId: row.actor_agent_id ?? undefined,
+    payload: row.payload ?? {},
+    createdAt: new Date(row.created_at).toISOString()
+  };
+}
+
+function mapDelegation(row: any): CardDelegation {
+  return {
+    id: row.id,
+    cardId: row.card_id,
+    agentId: row.agent_id,
+    runId: row.run_id ?? undefined,
+    sessionKey: row.session_key ?? undefined,
+    sessionId: row.session_id ?? undefined,
+    status: row.status,
+    externalStatus: row.external_status ?? undefined,
+    taskDescription: row.task_description ?? undefined,
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+    completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : undefined
+  };
+}
+
+export async function appendEvent(input: {
+  cardId: string;
+  eventType: string;
+  eventKey?: string;
+  source?: string;
+  actorAgentId?: string;
+  payload?: unknown;
+}) {
+  await pool.query(
+    `INSERT INTO card_events(card_id, event_type, event_key, source, actor_agent_id, payload)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+    [
+      input.cardId,
+      input.eventType,
+      input.eventKey ?? input.eventType,
+      input.source ?? 'app',
+      input.actorAgentId ?? null,
+      JSON.stringify(input.payload ?? {})
+    ]
+  );
 }
 
 export async function listCards(): Promise<Card[]> {
   const result = await pool.query('SELECT * FROM cards ORDER BY created_at DESC');
   return result.rows.map(mapCard);
+}
+
+export async function getCard(id: string): Promise<Card | undefined> {
+  const result = await pool.query('SELECT * FROM cards WHERE id = $1', [id]);
+  return result.rowCount ? mapCard(result.rows[0]) : undefined;
+}
+
+export async function listCardTimeline(cardId: string): Promise<CardTimelineEvent[]> {
+  const result = await pool.query('SELECT * FROM card_events WHERE card_id = $1 ORDER BY created_at ASC, id ASC', [cardId]);
+  return result.rows.map(mapEvent);
 }
 
 export async function createCard(input: { title: string; description?: string; dueAt?: string }): Promise<Card> {
@@ -40,7 +94,7 @@ export async function createCard(input: { title: string; description?: string; d
   );
 
   const card = mapCard(result.rows[0]);
-  await appendEvent(card.id, 'card.created', { card });
+  await appendEvent({ cardId: card.id, eventType: 'card.created', eventKey: 'card.created', payload: { card } });
   return card;
 }
 
@@ -48,7 +102,7 @@ export async function moveCard(id: string, stage: Stage): Promise<Card | undefin
   const result = await pool.query('UPDATE cards SET stage = $2, updated_at = NOW() WHERE id = $1 RETURNING *', [id, stage]);
   if (!result.rowCount) return;
   const card = mapCard(result.rows[0]);
-  await appendEvent(card.id, 'card.moved', { stage: card.stage });
+  await appendEvent({ cardId: card.id, eventType: 'card.moved', eventKey: 'card.moved', payload: { stage: card.stage } });
   return card;
 }
 
@@ -59,7 +113,13 @@ export async function assignCard(id: string, assigneeAgentId: string): Promise<C
   );
   if (!result.rowCount) return;
   const card = mapCard(result.rows[0]);
-  await appendEvent(card.id, 'card.assigned', { assigneeAgentId: card.assigneeAgentId });
+  await appendEvent({
+    cardId: card.id,
+    eventType: 'card.assigned',
+    eventKey: 'card.assigned',
+    actorAgentId: assigneeAgentId,
+    payload: { assigneeAgentId: card.assigneeAgentId }
+  });
   return card;
 }
 
@@ -73,6 +133,90 @@ export async function approveCard(id: string): Promise<Card | undefined> {
   );
   if (!result.rowCount) return;
   const card = mapCard(result.rows[0]);
-  await appendEvent(card.id, 'approval.accepted', { approvedAt: card.approvedAt });
+  await appendEvent({ cardId: card.id, eventType: 'approval.accepted', eventKey: 'card.approved', payload: { approvedAt: card.approvedAt } });
   return card;
+}
+
+export async function upsertAgents(agents: Agent[]): Promise<void> {
+  if (!agents.length) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const agent of agents) {
+      await client.query(
+        `INSERT INTO agents(agent_id, name, emoji, theme, is_orchestrator, updated_at)
+         VALUES ($1,$2,$3,$4,$5,NOW())
+         ON CONFLICT(agent_id) DO UPDATE
+         SET name = EXCLUDED.name,
+             emoji = EXCLUDED.emoji,
+             theme = EXCLUDED.theme,
+             is_orchestrator = EXCLUDED.is_orchestrator,
+             updated_at = NOW()`,
+        [agent.agentId, agent.name, agent.emoji, agent.theme ?? null, agent.isOrchestrator]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function createDelegation(input: { cardId: string; agentId: string; taskDescription?: string }): Promise<CardDelegation> {
+  const result = await pool.query(
+    `INSERT INTO card_delegations(card_id, agent_id, task_description, status, updated_at)
+     VALUES($1,$2,$3,'pending',NOW())
+     RETURNING *`,
+    [input.cardId, input.agentId, input.taskDescription ?? null]
+  );
+  const delegation = mapDelegation(result.rows[0]);
+  await appendEvent({
+    cardId: input.cardId,
+    eventType: 'delegation.created',
+    eventKey: 'card.delegated',
+    actorAgentId: input.agentId,
+    payload: { delegation }
+  });
+  return delegation;
+}
+
+export async function attachDelegationSession(
+  delegationId: number,
+  input: { runId?: string; sessionKey?: string; sessionId?: string; status?: string; externalStatus?: string }
+): Promise<CardDelegation | undefined> {
+  const result = await pool.query(
+    `UPDATE card_delegations
+      SET run_id = COALESCE($2, run_id),
+          session_key = COALESCE($3, session_key),
+          session_id = COALESCE($4, session_id),
+          status = COALESCE($5, status),
+          external_status = COALESCE($6, external_status),
+          updated_at = NOW()
+      WHERE id = $1
+      RETURNING *`,
+    [delegationId, input.runId ?? null, input.sessionKey ?? null, input.sessionId ?? null, input.status ?? null, input.externalStatus ?? null]
+  );
+  if (!result.rowCount) return;
+  return mapDelegation(result.rows[0]);
+}
+
+export async function findDelegationByRunId(runId: string): Promise<CardDelegation | undefined> {
+  const result = await pool.query('SELECT * FROM card_delegations WHERE run_id = $1', [runId]);
+  return result.rowCount ? mapDelegation(result.rows[0]) : undefined;
+}
+
+export async function listPolicyCandidates(nowIso: string): Promise<Card[]> {
+  const result = await pool.query(
+    `SELECT * FROM cards
+      WHERE stage NOT IN ('done')
+        AND (
+          (due_at IS NOT NULL AND due_at <= $1::timestamptz)
+          OR (stage = 'review' AND updated_at < NOW() - INTERVAL '2 hours')
+          OR (updated_at < NOW() - INTERVAL '24 hours')
+        )`,
+    [nowIso]
+  );
+  return result.rows.map(mapCard);
 }
