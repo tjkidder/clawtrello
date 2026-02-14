@@ -100,9 +100,10 @@ app.get('/api/cards', async (_req, res) => {
 });
 
 app.get(['/api/cards/:id/timeline', '/cards/:id/timeline'], async (req, res) => {
-  const card = await getCard(req.params.id);
+  const cardId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const card = await getCard(cardId);
   if (!card) return res.status(404).json({ error: 'card not found' });
-  res.json({ cardId: req.params.id, events: await listCardTimeline(req.params.id) });
+  res.json({ cardId, events: await listCardTimeline(cardId) });
 });
 
 app.post('/api/cards', async (req, res) => {
@@ -150,6 +151,7 @@ app.post('/api/cards/:id/delegate', async (req, res) => {
         sessionKey?: string;
         runId?: string;
         sessionId?: string;
+        sessionKeyFormat?: string;
       }
     | undefined;
   try {
@@ -176,10 +178,12 @@ app.post('/api/cards/:id/delegate', async (req, res) => {
   res.status(201).json({ delegation, spawn: spawnResult ?? { ok: false, reason: 'unknown' } });
 });
 
-app.post('/api/delegations/:sessionKey/resume', async (req, res) => {
+app.post('/api/delegations/:id/resume', async (req, res) => {
+  const delegationId = Number(req.params.id);
   const { message } = req.body ?? {};
+  if (!Number.isFinite(delegationId)) return res.status(400).json({ error: 'invalid delegation id' });
   if (!message) return res.status(400).json({ error: 'message is required' });
-  await openclawGateway.sendResume(req.params.sessionKey, message);
+  await openclawGateway.resumeDelegation(delegationId, message);
   res.json({ ok: true });
 });
 
