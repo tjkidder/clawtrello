@@ -474,7 +474,7 @@ export class OpenClawGateway {
   }
 
   private buildDelegationSessionKey(cardId: string, agentId: string): string {
-    return `clawtrello:card:${cardId}:agent:${agentId}`;
+    return `agent:${agentId}:card:${cardId}`;
   }
 
   private async messageToString(data: unknown): Promise<string> {
