@@ -282,8 +282,9 @@ export class OpenClawGateway {
     }
 
     const requestId = randomUUID();
-    console.info(`[openclaw] request method=${method}`);
-    const sent = this.send({ type: 'req', id: requestId, method, params: payload });
+    const finalParams = method === 'agent.wait' ? this.stripSessionKey(payload) : payload;
+    console.info('[openclaw] sending', method, JSON.stringify(finalParams));
+    const sent = this.send({ type: 'req', id: requestId, method, params: finalParams });
     if (!sent) {
       throw new Error('failed to send gateway request');
     }
@@ -475,6 +476,11 @@ export class OpenClawGateway {
 
   private buildDelegationSessionKey(cardId: string, agentId: string): string {
     return `agent:${agentId}:card:${cardId}`;
+  }
+
+  private stripSessionKey(payload: Record<string, unknown>): Record<string, unknown> {
+    const { sessionKey: _sessionKey, ...paramsWithoutSessionKey } = payload;
+    return paramsWithoutSessionKey;
   }
 
   private async messageToString(data: unknown): Promise<string> {
