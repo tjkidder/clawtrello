@@ -94,6 +94,7 @@ export class OpenClawGateway {
     const sessionKey = this.buildDelegationSessionKey(input.cardId, input.agentId);
     const idempotencyKey = `delegation:${input.delegationId}:card:${input.cardId}:agent:${input.agentId}`;
     let response: any;
+    let runId: string;
     try {
       response = await this.runAgentTask({
         agentId: input.agentId,
@@ -103,22 +104,21 @@ export class OpenClawGateway {
         timeoutSeconds: 600
       });
 
-      if (this.supportedMethods.includes('agent.wait')) {
-        await this.request(
-          'agent.wait',
-          {
-            sessionKey,
-            timeoutMs: 30_000
-          },
-          35_000
+      runId = response?.payload?.runId ?? response?.runId;
+      if (!runId) {
+        throw new Error(
+          `agent did not return runId (agentId=${input.agentId}, cardId=${input.cardId}, sessionKey=${sessionKey})`
         );
+      }
+
+      if (this.supportedMethods.includes('agent.wait')) {
+        await this.request('agent.wait', { runId });
       }
     } catch (error) {
       console.error('[openclaw] delegation start request failed:', error);
       throw error;
     }
 
-    const runId = response?.runId ?? response?.payload?.runId;
     const responseSessionKey = response?.sessionKey ?? response?.payload?.sessionKey ?? response?.payload?.childSessionKey;
     const sessionId = response?.sessionId ?? response?.payload?.sessionId;
 
