@@ -66,3 +66,7 @@ export function loadAgents(): Agent[] {
 export function getConfigPath(): string {
   return configPath;
 }
+
+export function getPreferredSessionKeyFormat(): string | undefined {
+  return process.env.OPENCLAW_SESSION_KEY_FORMAT;
+}

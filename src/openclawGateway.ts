@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { appendEvent, attachDelegationSession, findDelegationByRunId, findDelegationBySessionKey, moveCard } from './store.js';
+import { appendEvent, attachDelegationSession, findDelegationById, findDelegationByRunId, findDelegationBySessionKey, moveCard, updateDelegationSessionKey } from './store.js';
+import { getPreferredSessionKeyFormat } from './openclawConfig.js';
 
 interface GatewayOptions {
   endpoint?: string;
@@ -91,44 +92,50 @@ export class OpenClawGateway {
     }
 
     this.ensureMethod('agent');
-    const sessionKey = this.buildDelegationSessionKey(input.cardId, input.agentId);
-    const idempotencyKey = `delegation:${input.delegationId}:card:${input.cardId}:agent:${input.agentId}`;
+    const sessionKeyFormats = this.getSessionKeyFormats(input.cardId, input.agentId);
+
     let response: any;
-    let runId: string;
-    try {
-      response = await this.runAgentTask({
-        agentId: input.agentId,
-        sessionKey,
-        idempotencyKey,
-        message: input.taskDescription ?? '',
-        timeoutSeconds: 600
-      });
+    let successfulFormat: string | undefined;
+    let lastError: unknown;
 
-      runId = response?.payload?.runId ?? response?.runId;
-      if (!runId) {
-        throw new Error(
-          `agent did not return runId (agentId=${input.agentId}, cardId=${input.cardId}, sessionKey=${sessionKey})`
-        );
+    for (const sessionKey of sessionKeyFormats) {
+      try {
+        response = await this.trySpawnWithFormat(sessionKey, input);
+        successfulFormat = sessionKey;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (this.isAgentMismatchError(error)) {
+          console.warn(`[openclaw] session key format failed; retrying with fallback format (${sessionKey})`);
+          continue;
+        }
+        throw error;
       }
+    }
 
-      if (this.supportedMethods.includes('agent.wait')) {
-        await this.request('agent.wait', { runId });
-      }
-    } catch (error) {
-      console.error('[openclaw] delegation start request failed:', error);
-      throw error;
+    if (!response || !successfulFormat) {
+      throw lastError instanceof Error ? lastError : new Error('all session key formats failed');
+    }
+
+    const runId = response?.payload?.runId ?? response?.runId;
+    if (!runId) {
+      throw new Error(
+        `agent did not return runId (agentId=${input.agentId}, cardId=${input.cardId}, sessionKey=${successfulFormat})`
+      );
+    }
+
+    if (this.supportedMethods.includes('agent.wait')) {
+      await this.request('agent.wait', { runId });
     }
 
     const responseSessionKey = response?.sessionKey ?? response?.payload?.sessionKey ?? response?.payload?.childSessionKey;
     const sessionId = response?.sessionId ?? response?.payload?.sessionId;
+    const finalSessionKey = responseSessionKey ?? successfulFormat;
 
-    const delegation = await attachDelegationSession(input.delegationId, {
-      runId,
-      sessionKey: responseSessionKey ?? sessionKey,
-      sessionId,
-      status: 'active',
-      externalStatus: 'started'
-    });
+    const delegation = await updateDelegationSessionKey(input.delegationId, finalSessionKey, successfulFormat, runId);
+    if (sessionId) {
+      await attachDelegationSession(input.delegationId, { sessionId, externalStatus: 'started' });
+    }
 
     await appendEvent({
       cardId: input.cardId,
@@ -136,21 +143,43 @@ export class OpenClawGateway {
       eventKey: 'agent.started',
       source: 'openclaw',
       actorAgentId: input.agentId,
-      payload: { runId, sessionKey: responseSessionKey ?? sessionKey, sessionId, methodUsed: 'agent' }
+      payload: { runId, sessionKey: finalSessionKey, sessionId, sessionKeyFormat: successfulFormat, methodUsed: 'agent' }
     });
 
     return {
       ok: true as const,
       methodUsed: 'agent',
       delegation,
-      sessionKey: responseSessionKey ?? sessionKey,
+      sessionKey: finalSessionKey,
+      sessionKeyFormat: successfulFormat,
       runId,
       sessionId
     };
   }
 
+  async resumeDelegation(delegationId: number, message: string): Promise<void> {
+    const delegation = await findDelegationById(delegationId);
+    if (!delegation) {
+      throw new Error(`Delegation ${delegationId} not found`);
+    }
+
+    if (!delegation.sessionKey) {
+      throw new Error(`Delegation ${delegationId} has no session key - cannot resume`);
+    }
+
+    if (!this.isValidSessionKey(delegation.sessionKey)) {
+      throw new Error(`Delegation ${delegationId} has invalid session key format`);
+    }
+
+    await this.sendResume(delegation.sessionKey, message);
+    await attachDelegationSession(delegationId, {
+      status: 'in_progress',
+      externalStatus: 'resumed'
+    });
+  }
+
   async sendResume(sessionKey: string, message: string) {
-    await this.request('sessions_send', { sessionKey, message });
+    await this.request('sessions_send', { sessionKey, message, timeoutSeconds: 30 });
   }
 
   private connect() {
@@ -445,6 +474,48 @@ export class OpenClawGateway {
       default:
         break;
     }
+  }
+
+
+  private async trySpawnWithFormat(
+    sessionKey: string,
+    input: {
+      delegationId: number;
+      cardId: string;
+      agentId: string;
+      taskDescription?: string;
+    }
+  ): Promise<any> {
+    const idempotencyKey = `delegation:${input.delegationId}:session:${sessionKey}`;
+    return this.runAgentTask({
+      agentId: input.agentId,
+      sessionKey,
+      idempotencyKey,
+      message: input.taskDescription ?? '',
+      timeoutSeconds: 600
+    });
+  }
+
+  private getSessionKeyFormats(cardId: string, agentId: string): string[] {
+    const preferred = getPreferredSessionKeyFormat();
+    const formats = [
+      preferred,
+      this.buildDelegationSessionKey(cardId, agentId),
+      `${agentId}:card:${cardId}`,
+      `agent:${agentId}:${cardId}`
+    ].filter((value): value is string => Boolean(value));
+
+    return [...new Set(formats)];
+  }
+
+  private isAgentMismatchError(error: unknown): boolean {
+    if (!error) return false;
+    const message = JSON.stringify(error).toLowerCase();
+    return message.includes('does not match session key') || message.includes('agent mismatch');
+  }
+
+  private isValidSessionKey(sessionKey: string): boolean {
+    return /^agent:[a-z0-9-]+:card:[a-f0-9-]+$/i.test(sessionKey);
   }
 
   private parseHeaders(headersJson: string | undefined): Record<string, string> | undefined {

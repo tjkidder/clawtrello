@@ -53,6 +53,7 @@ export interface CardDelegation {
   runId?: string;
   sessionKey?: string;
   sessionId?: string;
+  sessionKeyFormat?: string;
   status: string;
   externalStatus?: string;
   taskDescription?: string;

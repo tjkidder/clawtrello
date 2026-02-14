@@ -37,6 +37,7 @@ function mapDelegation(row: any): CardDelegation {
     runId: row.run_id ?? undefined,
     sessionKey: row.session_key ?? undefined,
     sessionId: row.session_id ?? undefined,
+    sessionKeyFormat: row.session_key_format ?? undefined,
     status: row.status,
     externalStatus: row.external_status ?? undefined,
     taskDescription: row.task_description ?? undefined,
@@ -77,7 +78,7 @@ export async function hasRecentEvent(cardId: string, eventKey: string, windowMin
       LIMIT 1`,
     [cardId, eventKey, String(windowMinutes)]
   );
-  return result.rowCount > 0;
+  return (result.rowCount ?? 0) > 0;
 }
 
 export async function hasEvent(cardId: string, eventKey: string): Promise<boolean> {
@@ -87,7 +88,7 @@ export async function hasEvent(cardId: string, eventKey: string): Promise<boolea
       LIMIT 1`,
     [cardId, eventKey]
   );
-  return result.rowCount > 0;
+  return (result.rowCount ?? 0) > 0;
 }
 
 export async function listCards(): Promise<Card[]> {
@@ -204,6 +205,35 @@ export async function createDelegation(input: { cardId: string; agentId: string;
   return mapDelegation(result.rows[0]);
 }
 
+export async function findDelegationById(delegationId: number): Promise<CardDelegation | undefined> {
+  const result = await pool.query('SELECT * FROM card_delegations WHERE id = $1', [delegationId]);
+  return result.rowCount ? mapDelegation(result.rows[0]) : undefined;
+}
+
+export async function updateDelegationSessionKey(
+  delegationId: number,
+  sessionKey: string,
+  sessionKeyFormat: string,
+  runId?: string
+): Promise<CardDelegation | undefined> {
+  const result = await pool.query(
+    `UPDATE card_delegations
+      SET session_key = $2,
+          session_key_format = $3,
+          run_id = COALESCE($4, run_id),
+          status = 'active',
+          started_at = COALESCE(started_at, NOW()),
+          last_activity_at = NOW(),
+          updated_at = NOW()
+      WHERE id = $1
+      RETURNING *`,
+    [delegationId, sessionKey, sessionKeyFormat, runId ?? null]
+  );
+
+  if (!result.rowCount) return;
+  return mapDelegation(result.rows[0]);
+}
+
 export async function attachDelegationSession(
   delegationId: number,
   input: { runId?: string; sessionKey?: string; sessionId?: string; status?: string; externalStatus?: string }
@@ -231,7 +261,10 @@ export async function findDelegationByRunId(runId: string): Promise<CardDelegati
 }
 
 export async function findDelegationBySessionKey(sessionKey: string): Promise<CardDelegation | undefined> {
-  const result = await pool.query('SELECT * FROM card_delegations WHERE session_key = $1', [sessionKey]);
+  const result = await pool.query(
+    'SELECT * FROM card_delegations WHERE session_key = $1 ORDER BY created_at DESC LIMIT 1',
+    [sessionKey]
+  );
   return result.rowCount ? mapDelegation(result.rows[0]) : undefined;
 }
 
