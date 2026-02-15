@@ -28,6 +28,8 @@ export type CardEventKey =
   | 'approval.requested'
   | 'card.delegated'
   | 'agent.started'
+  | 'agent.completed'
+  | 'agent.error'
   | 'agent.progress'
   | 'card.completed'
   | 'card.blocked'
