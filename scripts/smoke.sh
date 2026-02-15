@@ -21,9 +21,20 @@ CARD_ID=$(echo "$CARD_JSON" | python3 -c 'import json,sys; print(json.load(sys.s
 echo "CARD_ID=$CARD_ID"
 
 echo "Delegate:"
-curl -s -X POST "$BASE/api/cards/$CARD_ID/delegate" \
+DELEGATE_JSON=$(curl -s -X POST "$BASE/api/cards/$CARD_ID/delegate" \
   -H "Content-Type: application/json" \
-  -d '{"agentId":"researcher","taskDescription":"hi"}' | python3 -m json.tool
+  -d '{"agentId":"researcher","taskDescription":"hi"}')
+echo "$DELEGATE_JSON" | python3 -m json.tool
+DELEGATION_ID=$(echo "$DELEGATE_JSON" | python3 -c 'import json,sys; data=json.load(sys.stdin); print((data.get("delegation") or {}).get("id") or ((data.get("spawn") or {}).get("delegation") or {}).get("id") or "")')
+if [[ -n "$DELEGATION_ID" ]]; then
+  echo "DELEGATION_ID=$DELEGATION_ID"
+  echo "Resume:"
+  curl -s -X POST "$BASE/api/delegations/$DELEGATION_ID/resume" \
+    -H "Content-Type: application/json" \
+    -d '{"message":"resume ping"}' | python3 -m json.tool
+else
+  echo "No DELEGATION_ID found in delegate response; skipping resume step"
+fi
 
 echo "Transcript:"
 curl -s "$BASE/api/cards/$CARD_ID/transcript" | python3 -m json.tool
