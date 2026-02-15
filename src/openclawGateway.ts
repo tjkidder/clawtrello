@@ -24,6 +24,9 @@ interface GatewayStatus {
   lastHandshakeAt?: string;
   lastCloseCode?: number;
   lastCloseReason?: string;
+  supportedMethods: string[];
+  lastHelloAt: string | null;
+  lastHealthAt: string | null;
 }
 
 export class OpenClawGateway {
@@ -44,7 +47,9 @@ export class OpenClawGateway {
   private lastCloseCode?: number;
   private lastCloseReason?: string;
   private challengeWatchdog?: NodeJS.Timeout;
-  private supportedMethods: string[] = [];
+  private supportedMethods = new Set<string>();
+  private lastHelloAt?: string;
+  private lastHealthAt?: string;
 
   constructor(options: GatewayOptions = {}) {
     this.endpoint = options.endpoint ?? process.env.OPENCLAW_WS_URL;
@@ -77,8 +82,15 @@ export class OpenClawGateway {
       lastError: this.lastError,
       lastHandshakeAt: this.lastHandshakeAt,
       lastCloseCode: this.lastCloseCode,
-      lastCloseReason: this.lastCloseReason
+      lastCloseReason: this.lastCloseReason,
+      supportedMethods: Array.from(this.supportedMethods ?? []),
+      lastHelloAt: this.lastHelloAt ?? null,
+      lastHealthAt: this.lastHealthAt ?? null
     };
+  }
+
+  supports(method: string): boolean {
+    return this.supportedMethods?.has(method) ?? false;
   }
 
   async spawnDelegation(input: {
@@ -124,7 +136,7 @@ export class OpenClawGateway {
       );
     }
 
-    if (this.supportedMethods.includes('agent.wait')) {
+    if (this.supports('agent.wait')) {
       await this.request('agent.wait', { runId });
     }
 
@@ -157,29 +169,67 @@ export class OpenClawGateway {
     };
   }
 
-  async resumeDelegation(delegationId: number, message: string): Promise<void> {
+  async resumeDelegation(delegationId: number, message: string): Promise<{ methodUsed: string; runId?: string }> {
     const delegation = await findDelegationById(delegationId);
     if (!delegation) {
       throw new Error(`Delegation ${delegationId} not found`);
     }
 
-    if (!delegation.sessionKey) {
-      throw new Error(`Delegation ${delegationId} has no session key - cannot resume`);
+    if (this.supports('chat.send')) {
+      if (!delegation.sessionKey) {
+        throw new Error(`Delegation ${delegationId} has no session key - cannot resume`);
+      }
+
+      try {
+        await this.request('chat.send', { sessionKey: delegation.sessionKey, message, timeoutSeconds: 30 });
+        await attachDelegationSession(delegationId, {
+          status: 'in_progress',
+          externalStatus: 'resumed'
+        });
+        return { methodUsed: 'chat.send', runId: delegation.runId };
+      } catch (err: any) {
+        const msg = err?.error?.message || err?.message || String(err);
+        throw new Error(`resume failed: ${msg}`);
+      }
     }
 
-    if (!this.isValidSessionKey(delegation.sessionKey)) {
-      throw new Error(`Delegation ${delegationId} has invalid session key format`);
+    if (delegation.runId && this.supports('agent.wait')) {
+      try {
+        await this.request('agent.wait', { runId: delegation.runId });
+        await attachDelegationSession(delegationId, {
+          status: 'in_progress',
+          externalStatus: 'waiting'
+        });
+        return { methodUsed: 'agent.wait', runId: delegation.runId };
+      } catch (err: any) {
+        const msg = err?.error?.message || err?.message || String(err);
+        throw new Error(`resume failed: ${msg}`);
+      }
     }
 
-    await this.sendResume(delegation.sessionKey, message);
-    await attachDelegationSession(delegationId, {
-      status: 'in_progress',
-      externalStatus: 'resumed'
-    });
+    const unsupportedError = new Error('resume not supported by gateway') as Error & { code?: string };
+    unsupportedError.code = 'UNSUPPORTED';
+    throw unsupportedError;
   }
 
-  async sendResume(sessionKey: string, message: string) {
-    await this.request('sessions_send', { sessionKey, message, timeoutSeconds: 30 });
+  async getTranscript(sessionKey: string): Promise<any[]> {
+    if (!this.supports('chat.history')) {
+      return [];
+    }
+
+    try {
+      const history = await this.request('chat.history', { sessionKey });
+      this.lastHealthAt = new Date().toISOString();
+      if (Array.isArray(history)) {
+        return history;
+      }
+      if (Array.isArray(history?.items)) {
+        return history.items;
+      }
+      return [];
+    } catch {
+      return [];
+    }
   }
 
   private connect() {
@@ -384,13 +434,14 @@ export class OpenClawGateway {
       (msg?.type === 'res' && msg?.ok && msg?.payload?.type === 'hello-ok') ||
       (msg?.type === 'event' && msg?.event === 'hello-ok');
     if (isHelloOk) {
-      this.supportedMethods = msg?.payload?.features?.methods ?? [];
+      this.supportedMethods = new Set(msg?.payload?.features?.methods ?? []);
       this.isConnected = true;
       this.lastError = undefined;
       this.lastHandshakeAt = new Date().toISOString();
       this.reconnectDelayMs = 1000;
       console.info('[openclaw] hello-ok received; gateway connected');
-      console.info('[openclaw] supported methods:', this.supportedMethods);
+      this.lastHelloAt = new Date().toISOString();
+      console.info('[openclaw] supported methods:', Array.from(this.supportedMethods));
       return;
     }
 
@@ -514,9 +565,6 @@ export class OpenClawGateway {
     return message.includes('does not match session key') || message.includes('agent mismatch');
   }
 
-  private isValidSessionKey(sessionKey: string): boolean {
-    return /^agent:[a-z0-9-]+:card:[a-f0-9-]+$/i.test(sessionKey);
-  }
 
   private parseHeaders(headersJson: string | undefined): Record<string, string> | undefined {
     if (!headersJson) return undefined;
@@ -541,8 +589,8 @@ export class OpenClawGateway {
   }
 
   private ensureMethod(method: string): void {
-    if (this.supportedMethods.includes(method)) return;
-    throw new Error(`Gateway does not advertise method ${method}. Known methods: ${JSON.stringify(this.supportedMethods)}`);
+    if (this.supports(method)) return;
+    throw new Error(`Gateway does not advertise method ${method}. Known methods: ${JSON.stringify(Array.from(this.supportedMethods))}`);
   }
 
   private buildDelegationSessionKey(cardId: string, agentId: string): string {

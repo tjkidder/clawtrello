@@ -106,6 +106,10 @@ export async function listCardTimeline(cardId: string): Promise<CardTimelineEven
   return result.rows.map(mapEvent);
 }
 
+export async function listCardEvents(cardId: string): Promise<CardTimelineEvent[]> {
+  return listCardTimeline(cardId);
+}
+
 export async function createCard(input: { title: string; description?: string; dueAt?: string }): Promise<Card> {
   const id = uuidv4();
   const now = new Date().toISOString();
@@ -264,6 +268,20 @@ export async function findDelegationBySessionKey(sessionKey: string): Promise<Ca
   const result = await pool.query(
     'SELECT * FROM card_delegations WHERE session_key = $1 ORDER BY created_at DESC LIMIT 1',
     [sessionKey]
+  );
+  return result.rowCount ? mapDelegation(result.rows[0]) : undefined;
+}
+
+export async function findLatestDelegationForCard(cardId: string): Promise<CardDelegation | undefined> {
+  const result = await pool.query(
+    `SELECT * FROM card_delegations
+      WHERE card_id = $1
+      ORDER BY
+        CASE WHEN status IN ('active', 'in_progress', 'review', 'pending') THEN 0 ELSE 1 END,
+        created_at DESC,
+        id DESC
+      LIMIT 1`,
+    [cardId]
   );
   return result.rowCount ? mapDelegation(result.rows[0]) : undefined;
 }
