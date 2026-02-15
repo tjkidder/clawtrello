@@ -29,6 +29,22 @@ interface GatewayStatus {
   lastHealthAt: string | null;
 }
 
+export class UnsupportedGatewayError extends Error {
+  code = 'UNSUPPORTED';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'UnsupportedGatewayError';
+  }
+}
+
+type SessionKeyFormatLabel = 'agent_card' | 'agentid_card' | 'legacy' | 'custom';
+
+interface SessionKeyCandidate {
+  label: SessionKeyFormatLabel;
+  key: string;
+}
+
 export class OpenClawGateway {
   private ws?: WebSocket;
   private reconnectTimer?: NodeJS.Timeout;
@@ -107,18 +123,18 @@ export class OpenClawGateway {
     const sessionKeyFormats = this.getSessionKeyFormats(input.cardId, input.agentId);
 
     let response: any;
-    let successfulFormat: string | undefined;
+    let successfulFormat: SessionKeyFormatLabel | undefined;
     let lastError: unknown;
 
-    for (const sessionKey of sessionKeyFormats) {
+    for (const sessionKeyCandidate of sessionKeyFormats) {
       try {
-        response = await this.trySpawnWithFormat(sessionKey, input);
-        successfulFormat = sessionKey;
+        response = await this.trySpawnWithFormat(sessionKeyCandidate.key, input);
+        successfulFormat = sessionKeyCandidate.label;
         break;
       } catch (error) {
         lastError = error;
         if (this.isAgentMismatchError(error)) {
-          console.warn(`[openclaw] session key format failed; retrying with fallback format (${sessionKey})`);
+          console.warn(`[openclaw] session key format failed; retrying with fallback format (${sessionKeyCandidate.label})`);
           continue;
         }
         throw error;
@@ -131,9 +147,7 @@ export class OpenClawGateway {
 
     const runId = response?.payload?.runId ?? response?.runId;
     if (!runId) {
-      throw new Error(
-        `agent did not return runId (agentId=${input.agentId}, cardId=${input.cardId}, sessionKey=${successfulFormat})`
-      );
+      throw new Error(`agent did not return runId (agentId=${input.agentId}, cardId=${input.cardId}, sessionKeyFormat=${successfulFormat})`);
     }
 
     if (this.supports('agent.wait')) {
@@ -142,7 +156,11 @@ export class OpenClawGateway {
 
     const responseSessionKey = response?.sessionKey ?? response?.payload?.sessionKey ?? response?.payload?.childSessionKey;
     const sessionId = response?.sessionId ?? response?.payload?.sessionId;
-    const finalSessionKey = responseSessionKey ?? successfulFormat;
+    const attemptedSessionKey = sessionKeyFormats.find((candidate) => candidate.label === successfulFormat)?.key;
+    const finalSessionKey = responseSessionKey ?? attemptedSessionKey;
+    if (!finalSessionKey) {
+      throw new Error(`agent did not return sessionKey and no attempted key was available for format ${successfulFormat}`);
+    }
 
     const delegation = await updateDelegationSessionKey(input.delegationId, finalSessionKey, successfulFormat, runId);
     if (sessionId) {
@@ -181,15 +199,18 @@ export class OpenClawGateway {
       }
 
       try {
-        await this.request('chat.send', { sessionKey: delegation.sessionKey, message, timeoutSeconds: 30 });
+        const idempotencyKey = `resume:${delegation.id}:${Date.now()}`;
+        await this.request('chat.send', { idempotencyKey, sessionKey: delegation.sessionKey, message });
         await attachDelegationSession(delegationId, {
           status: 'in_progress',
           externalStatus: 'resumed'
         });
         return { methodUsed: 'chat.send', runId: delegation.runId };
       } catch (err: any) {
-        const msg = err?.error?.message || err?.message || String(err);
-        throw new Error(`resume failed: ${msg}`);
+        if (this.isSchemaCompatibilityError(err)) {
+          throw new UnsupportedGatewayError(`resume is not supported by this gateway schema: ${this.errorMessage(err)}`);
+        }
+        throw new Error(`resume failed: ${this.errorMessage(err)}`);
       }
     }
 
@@ -207,9 +228,7 @@ export class OpenClawGateway {
       }
     }
 
-    const unsupportedError = new Error('resume not supported by gateway') as Error & { code?: string };
-    unsupportedError.code = 'UNSUPPORTED';
-    throw unsupportedError;
+    throw new UnsupportedGatewayError('resume not supported by gateway');
   }
 
   async getTranscript(sessionKey: string): Promise<any[]> {
@@ -220,13 +239,7 @@ export class OpenClawGateway {
     try {
       const history = await this.request('chat.history', { sessionKey });
       this.lastHealthAt = new Date().toISOString();
-      if (Array.isArray(history)) {
-        return history;
-      }
-      if (Array.isArray(history?.items)) {
-        return history.items;
-      }
-      return [];
+      return this.normalizeTranscript(history);
     } catch {
       return [];
     }
@@ -547,16 +560,82 @@ export class OpenClawGateway {
     });
   }
 
-  private getSessionKeyFormats(cardId: string, agentId: string): string[] {
+  private getSessionKeyFormats(cardId: string, agentId: string): SessionKeyCandidate[] {
     const preferred = getPreferredSessionKeyFormat();
-    const formats = [
-      preferred,
-      this.buildDelegationSessionKey(cardId, agentId),
-      `${agentId}:card:${cardId}`,
-      `agent:${agentId}:${cardId}`
-    ].filter((value): value is string => Boolean(value));
+    const formats: SessionKeyCandidate[] = [
+      this.resolvePreferredSessionKeyCandidate(preferred, cardId, agentId),
+      { label: 'agent_card', key: this.buildDelegationSessionKey(cardId, agentId) },
+      { label: 'agentid_card', key: `${agentId}:card:${cardId}` },
+      { label: 'legacy', key: `agent:${agentId}:${cardId}` }
+    ].filter((value): value is SessionKeyCandidate => Boolean(value?.key));
 
-    return [...new Set(formats)];
+    const seenKeys = new Set<string>();
+    return formats.filter((candidate) => {
+      if (seenKeys.has(candidate.key)) return false;
+      seenKeys.add(candidate.key);
+      return true;
+    });
+  }
+
+  private resolvePreferredSessionKeyCandidate(preferred: string | undefined, cardId: string, agentId: string): SessionKeyCandidate | undefined {
+    if (!preferred) return;
+
+    if (preferred === 'agent_card') {
+      return { label: 'agent_card', key: this.buildDelegationSessionKey(cardId, agentId) };
+    }
+    if (preferred === 'agentid_card') {
+      return { label: 'agentid_card', key: `${agentId}:card:${cardId}` };
+    }
+    if (preferred === 'legacy') {
+      return { label: 'legacy', key: `agent:${agentId}:${cardId}` };
+    }
+
+    return { label: 'custom', key: preferred };
+  }
+
+  private normalizeTranscript(history: any): Array<{ role: string; text: string; timestamp: string | null }> {
+    const messages =
+      (Array.isArray(history) && history) ||
+      (Array.isArray(history?.messages) && history.messages) ||
+      (Array.isArray(history?.items) && history.items) ||
+      (Array.isArray(history?.payload?.messages) && history.payload.messages) ||
+      [];
+
+    return messages.map((message: any) => ({
+      role: message?.role ?? 'unknown',
+      text: this.extractTextContent(message?.content),
+      timestamp: message?.timestamp ?? null
+    }));
+  }
+
+  private extractTextContent(content: unknown): string {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+
+    return content
+      .map((item: any) => {
+        if (typeof item === 'string') return item;
+        if (item?.type === 'text' && typeof item?.text === 'string') return item.text;
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  private isSchemaCompatibilityError(error: any): boolean {
+    const code = error?.code ?? error?.error?.code;
+    const message = this.errorMessage(error).toLowerCase();
+    if (code !== 'INVALID_REQUEST') return false;
+    return (
+      message.includes('must have required property') ||
+      message.includes('unexpected property') ||
+      message.includes('schema') ||
+      message.includes('params')
+    );
+  }
+
+  private errorMessage(error: any): string {
+    return error?.error?.message || error?.message || String(error);
   }
 
   private isAgentMismatchError(error: unknown): boolean {

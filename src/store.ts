@@ -277,6 +277,7 @@ export async function findLatestDelegationForCard(cardId: string): Promise<CardD
     `SELECT * FROM card_delegations
       WHERE card_id = $1
       ORDER BY
+        CASE WHEN session_key IS NOT NULL THEN 0 ELSE 1 END,
         CASE WHEN status IN ('active', 'in_progress', 'review', 'pending') THEN 0 ELSE 1 END,
         created_at DESC,
         id DESC

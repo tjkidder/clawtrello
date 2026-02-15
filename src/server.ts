@@ -220,7 +220,7 @@ app.post('/api/delegations/:id/resume', asyncHandler(async (req, res) => {
   } catch (error: any) {
     const msg = stringifyErr(error);
     if (error?.code === 'UNSUPPORTED' || msg.includes('not supported')) {
-      return res.status(501).json({ ok: false, error: msg });
+      return res.status(501).json({ ok: false, error: msg, code: 'UNSUPPORTED' });
     }
     throw error;
   }
