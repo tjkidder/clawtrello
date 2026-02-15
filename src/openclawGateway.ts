@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { appendEvent, attachDelegationSession, findDelegationById, findDelegationByRunId, findDelegationBySessionKey, moveCard, updateDelegationSessionKey } from './store.js';
+import { appendEvent, attachDelegationSession, findDelegationById, findDelegationByRunId, findDelegationBySessionKey, getCard, moveCard, updateDelegationSessionKey } from './store.js';
 import { getPreferredSessionKeyFormat } from './openclawConfig.js';
+import { Stage } from './types.js';
 
 interface GatewayOptions {
   endpoint?: string;
@@ -27,6 +28,15 @@ interface GatewayStatus {
   supportedMethods: string[];
   lastHelloAt: string | null;
   lastHealthAt: string | null;
+}
+
+interface NormalizedGatewayEvent {
+  eventKey: string;
+  stageUpdate?: Stage;
+  actorAgentId?: string;
+  delegationStatus?: string;
+  externalStatus?: string;
+  payload: Record<string, unknown>;
 }
 
 export class UnsupportedGatewayError extends Error {
@@ -458,8 +468,8 @@ export class OpenClawGateway {
       return;
     }
 
-    const runId = msg?.runId ?? msg?.payload?.runId;
-    const sessionKey = msg?.sessionKey ?? msg?.payload?.sessionKey ?? msg?.payload?.childSessionKey;
+    const runId = msg?.runId ?? msg?.payload?.runId ?? msg?.payload?.data?.runId;
+    const sessionKey = msg?.sessionKey ?? msg?.payload?.sessionKey ?? msg?.payload?.childSessionKey ?? msg?.payload?.data?.sessionKey;
     const delegation = runId
       ? await findDelegationByRunId(runId)
       : sessionKey
@@ -467,77 +477,30 @@ export class OpenClawGateway {
         : undefined;
 
     if (!delegation) return;
-
-    switch (messageType) {
-      case 'session.updated':
-        await attachDelegationSession(delegation.id, {
-          status: 'in_progress',
-          externalStatus: msg.payload?.status,
-          sessionId: msg.payload?.sessionId,
-          sessionKey: msg.payload?.sessionKey ?? msg.payload?.childSessionKey
-        });
-        await appendEvent({
-          cardId: delegation.cardId,
-          eventType: messageType,
-          eventKey: 'agent.progress',
-          source: 'openclaw',
-          actorAgentId: delegation.agentId,
-          payload: msg.payload
-        });
-        break;
-      case 'session.completed':
-        await attachDelegationSession(delegation.id, {
-          status: 'completed',
-          externalStatus: 'completed'
-        });
-        await moveCard(delegation.cardId, 'review');
-        this.onCardChanged?.(delegation.cardId);
-        await appendEvent({
-          cardId: delegation.cardId,
-          eventType: messageType,
-          eventKey: 'card.completed',
-          source: 'openclaw',
-          actorAgentId: delegation.agentId,
-          payload: msg.payload
-        });
-        break;
-      case 'session.error':
-        await attachDelegationSession(delegation.id, {
-          status: 'error',
-          externalStatus: 'session.error'
-        });
-        await moveCard(delegation.cardId, 'blocked');
-        this.onCardChanged?.(delegation.cardId);
-        await appendEvent({
-          cardId: delegation.cardId,
-          eventType: messageType,
-          eventKey: 'card.blocked',
-          source: 'openclaw',
-          actorAgentId: delegation.agentId,
-          payload: msg.payload
-        });
-        break;
-      case 'exec.approval.requested': {
-        const targetStage = msg.payload?.requiresHumanHelp ? 'blocked' : 'review';
-        await attachDelegationSession(delegation.id, {
-          status: targetStage === 'blocked' ? 'blocked' : 'review',
-          externalStatus: 'approval.requested'
-        });
-        await moveCard(delegation.cardId, targetStage);
-        this.onCardChanged?.(delegation.cardId);
-        await appendEvent({
-          cardId: delegation.cardId,
-          eventType: messageType,
-          eventKey: 'approval.requested',
-          source: 'openclaw',
-          actorAgentId: delegation.agentId,
-          payload: msg.payload
-        });
-        break;
-      }
-      default:
-        break;
+    const normalizedEvent = this.normalizeGatewayEvent(messageType, msg);
+    if (!normalizedEvent) {
+      return;
     }
+
+    await attachDelegationSession(delegation.id, {
+      status: normalizedEvent.delegationStatus,
+      externalStatus: normalizedEvent.externalStatus,
+      sessionId: msg?.payload?.sessionId,
+      sessionKey: msg?.payload?.sessionKey ?? msg?.payload?.childSessionKey ?? msg?.payload?.data?.sessionKey
+    });
+
+    if (normalizedEvent.stageUpdate) {
+      await this.maybeMoveCardStage(delegation.cardId, normalizedEvent.stageUpdate);
+    }
+
+    await appendEvent({
+      cardId: delegation.cardId,
+      eventType: messageType,
+      eventKey: normalizedEvent.eventKey,
+      source: 'openclaw',
+      actorAgentId: normalizedEvent.actorAgentId ?? delegation.agentId,
+      payload: normalizedEvent.payload
+    });
   }
 
 
@@ -601,25 +564,165 @@ export class OpenClawGateway {
       (Array.isArray(history?.payload?.messages) && history.payload.messages) ||
       [];
 
-    return messages.map((message: any) => ({
-      role: message?.role ?? 'unknown',
-      text: this.extractTextContent(message?.content),
-      timestamp: message?.timestamp ?? null
-    }));
+    return messages.map((message: any) => {
+      const text = this.extractTextContent(message?.content).slice(0, 4000);
+      return {
+        role: message?.role ?? 'unknown',
+        text,
+        timestamp: message?.timestamp ?? null
+      };
+    });
   }
 
   private extractTextContent(content: unknown): string {
-    if (typeof content === 'string') return content;
-    if (!Array.isArray(content)) return '';
+    if (content == null) return '';
 
-    return content
-      .map((item: any) => {
-        if (typeof item === 'string') return item;
-        if (item?.type === 'text' && typeof item?.text === 'string') return item.text;
-        return '';
-      })
-      .filter(Boolean)
-      .join('\n');
+    if (typeof content === 'string') return content;
+
+    if (typeof content === 'object' && !Array.isArray(content)) {
+      const c: any = content;
+
+      if (typeof c.text === 'string' && c.text.trim().length) return c.text;
+      if (typeof c.content === 'string' && c.content.trim().length) return c.content;
+      if (typeof c.output_text === 'string' && c.output_text.trim().length) return c.output_text;
+      if (typeof c.value === 'string' && c.value.trim().length) return c.value;
+
+      try {
+        const serialized = JSON.stringify(c);
+        return serialized === '{}' ? '' : serialized;
+      } catch {
+        return String(c);
+      }
+    }
+
+    if (Array.isArray(content)) {
+      const parts = (content as any[])
+        .map((chunk) => {
+          if (chunk == null) return '';
+          if (typeof chunk === 'string') return chunk;
+
+          if (typeof chunk === 'object') {
+            const x: any = chunk;
+            if (typeof x.text === 'string') return x.text;
+            if (typeof x.content === 'string') return x.content;
+            if (typeof x.output_text === 'string') return x.output_text;
+            if (typeof x.value === 'string') return x.value;
+
+            try {
+              return JSON.stringify(x);
+            } catch {
+              return String(x);
+            }
+          }
+
+          return String(chunk);
+        })
+        .map((value) => value.trim())
+        .filter(Boolean);
+
+      return parts.join('\n');
+    }
+
+    return String(content);
+  }
+
+  private normalizeGatewayEvent(messageType: string, msg: any): NormalizedGatewayEvent | undefined {
+    const stream = msg?.payload?.stream;
+    const phase = msg?.payload?.data?.phase;
+
+    if (stream === 'error' || messageType === 'session.error' || msg?.ok === false || msg?.error) {
+      return {
+        eventKey: 'agent.error',
+        stageUpdate: 'blocked',
+        delegationStatus: 'error',
+        externalStatus: stream === 'error' ? 'stream.error' : messageType,
+        actorAgentId: msg?.payload?.agentId,
+        payload: this.toJsonSafePayload(msg?.payload ?? msg)
+      };
+    }
+
+    if (stream === 'lifecycle' && phase === 'start') {
+      return {
+        eventKey: 'agent.started',
+        stageUpdate: 'in_progress',
+        delegationStatus: 'in_progress',
+        externalStatus: 'lifecycle.start',
+        actorAgentId: msg?.payload?.agentId,
+        payload: this.toJsonSafePayload(msg?.payload ?? msg)
+      };
+    }
+
+    if (stream === 'lifecycle' && phase === 'end') {
+      return {
+        eventKey: 'agent.completed',
+        stageUpdate: 'review',
+        delegationStatus: 'completed',
+        externalStatus: 'lifecycle.end',
+        actorAgentId: msg?.payload?.agentId,
+        payload: this.toJsonSafePayload(msg?.payload ?? msg)
+      };
+    }
+
+    if (messageType === 'session.updated') {
+      return {
+        eventKey: 'agent.progress',
+        delegationStatus: 'in_progress',
+        externalStatus: msg?.payload?.status,
+        actorAgentId: msg?.payload?.agentId,
+        payload: this.toJsonSafePayload(msg?.payload ?? msg)
+      };
+    }
+
+    if (messageType === 'session.completed') {
+      return {
+        eventKey: 'agent.completed',
+        stageUpdate: 'review',
+        delegationStatus: 'completed',
+        externalStatus: 'completed',
+        actorAgentId: msg?.payload?.agentId,
+        payload: this.toJsonSafePayload(msg?.payload ?? msg)
+      };
+    }
+
+    if (messageType === 'exec.approval.requested' || messageType === 'exec.approval.request') {
+      return {
+        eventKey: 'approval.requested',
+        stageUpdate: 'review',
+        delegationStatus: 'review',
+        externalStatus: 'approval.requested',
+        actorAgentId: msg?.payload?.agentId,
+        payload: this.toJsonSafePayload(msg?.payload ?? msg)
+      };
+    }
+
+    return undefined;
+  }
+
+  private async maybeMoveCardStage(cardId: string, stageUpdate: Stage): Promise<void> {
+    const card = await getCard(cardId);
+    if (!card || !this.isAllowedAutoTransition(card.stage, stageUpdate)) {
+      return;
+    }
+
+    const updated = await moveCard(cardId, stageUpdate);
+    if (updated) {
+      this.onCardChanged?.(cardId);
+    }
+  }
+
+  private isAllowedAutoTransition(currentStage: Stage, nextStage: Stage): boolean {
+    if (currentStage === nextStage) return false;
+    if (nextStage === 'blocked') return true;
+    if (nextStage === 'in_progress') return currentStage === 'backlog';
+    if (nextStage === 'review') return currentStage === 'backlog' || currentStage === 'in_progress';
+    return false;
+  }
+
+  private toJsonSafePayload(payload: unknown): Record<string, unknown> {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return { value: payload as any };
+    }
+    return payload as Record<string, unknown>;
   }
 
   private isSchemaCompatibilityError(error: any): boolean {
