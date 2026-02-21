@@ -214,28 +214,40 @@ export async function findDelegationById(delegationId: number): Promise<CardDele
   return result.rowCount ? mapDelegation(result.rows[0]) : undefined;
 }
 
-export async function updateDelegationSessionKey(
+export async function updateDelegationSession(
   delegationId: number,
-  sessionKey: string,
-  sessionKeyFormat: string,
-  runId?: string
+  input: { runId?: string; sessionKey: string; sessionId?: string; sessionKeyFormat?: string }
 ): Promise<CardDelegation | undefined> {
   const result = await pool.query(
     `UPDATE card_delegations
       SET session_key = $2,
-          session_key_format = $3,
-          run_id = COALESCE($4, run_id),
+          session_key_format = COALESCE($3, session_key_format),
+          session_id = COALESCE($4, session_id),
+          run_id = COALESCE($5, run_id),
           status = 'active',
           started_at = COALESCE(started_at, NOW()),
           last_activity_at = NOW(),
           updated_at = NOW()
       WHERE id = $1
       RETURNING *`,
-    [delegationId, sessionKey, sessionKeyFormat, runId ?? null]
+    [delegationId, input.sessionKey, input.sessionKeyFormat ?? null, input.sessionId ?? null, input.runId ?? null]
   );
 
   if (!result.rowCount) return;
   return mapDelegation(result.rows[0]);
+}
+
+export async function updateDelegationSessionKey(
+  delegationId: number,
+  sessionKey: string,
+  sessionKeyFormat: string,
+  runId?: string
+): Promise<CardDelegation | undefined> {
+  return updateDelegationSession(delegationId, {
+    sessionKey,
+    sessionKeyFormat,
+    runId
+  });
 }
 
 export async function attachDelegationSession(

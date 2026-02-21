@@ -236,7 +236,7 @@ app.get('/api/cards/:id/transcript', asyncHandler(async (req, res) => {
     transcript = await openclawGateway.getTranscript(delegation.sessionKey).catch(() => []);
   }
 
-  res.json({ ok: true, cardId, events, transcript });
+  res.json({ cardId, events, transcript });
 }));
 
 app.post('/api/cards/:id/move', asyncHandler(async (req, res) => {

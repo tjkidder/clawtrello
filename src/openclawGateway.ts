@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { appendEvent, attachDelegationSession, findDelegationById, findDelegationByRunId, findDelegationBySessionKey, getCard, moveCard, updateDelegationSessionKey } from './store.js';
+import { appendEvent, attachDelegationSession, findDelegationById, findDelegationByRunId, findDelegationBySessionKey, findLatestDelegationForCard, getCard, moveCard, updateDelegationSession } from './store.js';
 import { getPreferredSessionKeyFormat } from './openclawConfig.js';
 import { Stage } from './types.js';
 
@@ -156,25 +156,28 @@ export class OpenClawGateway {
     }
 
     const runId = response?.payload?.runId ?? response?.runId;
-    if (!runId) {
-      throw new Error(`agent did not return runId (agentId=${input.agentId}, cardId=${input.cardId}, sessionKeyFormat=${successfulFormat})`);
-    }
-
-    if (this.supports('agent.wait')) {
-      await this.request('agent.wait', { runId });
-    }
-
     const responseSessionKey = response?.sessionKey ?? response?.payload?.sessionKey ?? response?.payload?.childSessionKey;
-    const sessionId = response?.sessionId ?? response?.payload?.sessionId;
-    const attemptedSessionKey = sessionKeyFormats.find((candidate) => candidate.label === successfulFormat)?.key;
-    const finalSessionKey = responseSessionKey ?? attemptedSessionKey;
+    const sessionKeyCandidate = sessionKeyFormats.find((candidate) => candidate.label === successfulFormat)?.key;
+    const finalSessionKey = responseSessionKey ?? sessionKeyCandidate;
+    const sessionId = response?.payload?.sessionId ?? response?.sessionId;
+
+    if (!runId) {
+      throw new Error(`agent did not return runId (agentId=${input.agentId}, cardId=${input.cardId}, sessionKey=${finalSessionKey ?? 'missing'})`);
+    }
+
     if (!finalSessionKey) {
       throw new Error(`agent did not return sessionKey and no attempted key was available for format ${successfulFormat}`);
     }
 
-    const delegation = await updateDelegationSessionKey(input.delegationId, finalSessionKey, successfulFormat, runId);
-    if (sessionId) {
-      await attachDelegationSession(input.delegationId, { sessionId, externalStatus: 'started' });
+    const delegation = await updateDelegationSession(input.delegationId, {
+      runId,
+      sessionKey: finalSessionKey,
+      sessionId,
+      sessionKeyFormat: successfulFormat
+    });
+
+    if (this.supports('agent.wait')) {
+      await this.request('agent.wait', { runId });
     }
 
     await appendEvent({
@@ -242,17 +245,27 @@ export class OpenClawGateway {
   }
 
   async getTranscript(sessionKey: string): Promise<any[]> {
-    if (!this.supports('chat.history')) {
-      return [];
+    if (this.supports('chat.history')) {
+      try {
+        const history = await this.request('chat.history', { sessionKey });
+        this.lastHealthAt = new Date().toISOString();
+        return this.normalizeTranscript(history);
+      } catch {
+        return [];
+      }
     }
 
-    try {
-      const history = await this.request('chat.history', { sessionKey });
-      this.lastHealthAt = new Date().toISOString();
-      return this.normalizeTranscript(history);
-    } catch {
-      return [];
+    if (this.supports('sessions.history')) {
+      try {
+        const history = await this.request('sessions.history', { sessionKey });
+        this.lastHealthAt = new Date().toISOString();
+        return this.normalizeTranscript(history);
+      } catch {
+        return [];
+      }
     }
+
+    return [];
   }
 
   private connect() {
@@ -470,23 +483,28 @@ export class OpenClawGateway {
 
     const runId = msg?.runId ?? msg?.payload?.runId ?? msg?.payload?.data?.runId;
     const sessionKey = msg?.sessionKey ?? msg?.payload?.sessionKey ?? msg?.payload?.childSessionKey ?? msg?.payload?.data?.sessionKey;
-    const delegation = runId
-      ? await findDelegationByRunId(runId)
-      : sessionKey
-        ? await findDelegationBySessionKey(sessionKey)
-        : undefined;
-
-    if (!delegation) return;
     const normalizedEvent = this.normalizeGatewayEvent(messageType, msg);
     if (!normalizedEvent) {
       return;
     }
 
+    const delegation = await this.findDelegationForMessage({ runId, sessionKey });
+    if (!delegation) {
+      console.warn('[openclaw] Orphaned event (no delegation)', {
+        messageType,
+        runId,
+        sessionKey,
+        eventKey: normalizedEvent.eventKey
+      });
+      return;
+    }
+
     await attachDelegationSession(delegation.id, {
+      runId,
       status: normalizedEvent.delegationStatus,
       externalStatus: normalizedEvent.externalStatus,
       sessionId: msg?.payload?.sessionId,
-      sessionKey: msg?.payload?.sessionKey ?? msg?.payload?.childSessionKey ?? msg?.payload?.data?.sessionKey
+      sessionKey
     });
 
     if (normalizedEvent.stageUpdate) {
@@ -565,7 +583,7 @@ export class OpenClawGateway {
       [];
 
     return messages.map((message: any) => {
-      const text = this.extractTextContent(message?.content).slice(0, 4000);
+      const text = this.extractTextContent(message).slice(0, 4000);
       return {
         role: message?.role ?? 'unknown',
         text,
@@ -574,56 +592,100 @@ export class OpenClawGateway {
     });
   }
 
-  private extractTextContent(content: unknown): string {
-    if (content == null) return '';
+  private extractTextContent(message: unknown): string {
+    if (message == null) return '';
+
+    const safeStringify = (value: unknown): string => {
+      const seen = new WeakSet<object>();
+      try {
+        return JSON.stringify(value, (_key, val) => {
+          if (typeof val === 'object' && val !== null) {
+            if (seen.has(val)) return '[Circular]';
+            seen.add(val);
+          }
+          return val;
+        });
+      } catch {
+        return String(value);
+      }
+    };
+
+    const content = typeof message === 'object' && message !== null ? (message as any).content : message;
 
     if (typeof content === 'string') return content;
 
-    if (typeof content === 'object' && !Array.isArray(content)) {
-      const c: any = content;
-
-      if (typeof c.text === 'string' && c.text.trim().length) return c.text;
-      if (typeof c.content === 'string' && c.content.trim().length) return c.content;
-      if (typeof c.output_text === 'string' && c.output_text.trim().length) return c.output_text;
-      if (typeof c.value === 'string' && c.value.trim().length) return c.value;
-
-      try {
-        const serialized = JSON.stringify(c);
-        return serialized === '{}' ? '' : serialized;
-      } catch {
-        return String(c);
-      }
-    }
-
     if (Array.isArray(content)) {
-      const parts = (content as any[])
+      const parts = content
         .map((chunk) => {
-          if (chunk == null) return '';
           if (typeof chunk === 'string') return chunk;
-
-          if (typeof chunk === 'object') {
-            const x: any = chunk;
-            if (typeof x.text === 'string') return x.text;
-            if (typeof x.content === 'string') return x.content;
-            if (typeof x.output_text === 'string') return x.output_text;
-            if (typeof x.value === 'string') return x.value;
-
-            try {
-              return JSON.stringify(x);
-            } catch {
-              return String(x);
-            }
+          if (chunk && typeof chunk === 'object') {
+            const candidate: any = chunk;
+            if (typeof candidate.text === 'string') return candidate.text;
+            if (candidate.type === 'text' && typeof candidate.text === 'string') return candidate.text;
           }
-
-          return String(chunk);
+          return '';
         })
         .map((value) => value.trim())
         .filter(Boolean);
-
-      return parts.join('\n');
+      if (parts.length) return parts.join('\n');
     }
 
-    return String(content);
+    if (content && typeof content === 'object' && typeof (content as any).text === 'string') {
+      return (content as any).text;
+    }
+
+    const payloads =
+      (typeof message === 'object' && message !== null && (message as any).payloads) ||
+      (typeof message === 'object' && message !== null && (message as any).result?.payloads);
+
+    if (Array.isArray(payloads)) {
+      const payloadText = payloads
+        .map((payload: any) => {
+          if (typeof payload?.text === 'string') return payload.text;
+          if (typeof payload?.content === 'string') return payload.content;
+          return '';
+        })
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .join('\n');
+      if (payloadText) return payloadText;
+    }
+
+    if (typeof (message as any)?.output_text === 'string') return (message as any).output_text;
+    if (typeof (message as any)?.text === 'string') return (message as any).text;
+
+    const serialized = safeStringify(message);
+    return serialized === '{}' ? '' : serialized;
+  }
+
+  private async findDelegationForMessage(input: { runId?: string; sessionKey?: string }) {
+    if (input.runId) {
+      const byRunId = await findDelegationByRunId(input.runId);
+      if (byRunId) return byRunId;
+    }
+
+    if (input.sessionKey) {
+      const bySessionKey = await findDelegationBySessionKey(input.sessionKey);
+      if (bySessionKey) return bySessionKey;
+
+      const cardId = this.extractCardIdFromSessionKey(input.sessionKey);
+      if (cardId) {
+        const byCard = await findLatestDelegationForCard(cardId);
+        if (byCard) return byCard;
+      }
+    }
+
+    return undefined;
+  }
+
+  private extractCardIdFromSessionKey(sessionKey: string): string | undefined {
+    const explicitCardMatch = sessionKey.match(/(?:^|:)card:([0-9a-fA-F-]{36})(?:$|:)/);
+    if (explicitCardMatch?.[1]) return explicitCardMatch[1];
+
+    const trailingUuidMatch = sessionKey.match(/([0-9a-fA-F-]{36})$/);
+    if (trailingUuidMatch?.[1]) return trailingUuidMatch[1];
+
+    return undefined;
   }
 
   private normalizeGatewayEvent(messageType: string, msg: any): NormalizedGatewayEvent | undefined {
@@ -712,10 +774,16 @@ export class OpenClawGateway {
 
   private isAllowedAutoTransition(currentStage: Stage, nextStage: Stage): boolean {
     if (currentStage === nextStage) return false;
-    if (nextStage === 'blocked') return true;
-    if (nextStage === 'in_progress') return currentStage === 'backlog';
-    if (nextStage === 'review') return currentStage === 'backlog' || currentStage === 'in_progress';
-    return false;
+
+    const allowedTransitions: Record<Stage, Stage[]> = {
+      backlog: ['in_progress'],
+      in_progress: ['review', 'blocked'],
+      review: ['blocked'],
+      blocked: ['in_progress'],
+      done: []
+    };
+
+    return allowedTransitions[currentStage].includes(nextStage);
   }
 
   private toJsonSafePayload(payload: unknown): Record<string, unknown> {
